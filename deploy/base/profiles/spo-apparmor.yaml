@@ -35,6 +35,7 @@ spec:
       readWritePaths:
       - /var/run/grpc/metrics.sock
       - /tmp/aa_profile_bin_*
+      - /etc/apparmor.d/
       - /etc/apparmor.d/**
       - /sys/kernel/security/apparmor/
       - /sys/kernel/security/apparmor/**
