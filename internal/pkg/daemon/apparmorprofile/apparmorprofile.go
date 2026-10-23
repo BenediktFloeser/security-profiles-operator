@@ -97,6 +97,9 @@ type Reconciler struct {
 	// loaded, like the ones which conflict with a profile of the host or of
 	// a container runtime.
 	rejected common.Reports[rejection]
+
+	// writtenStates keeps the node status states this node wrote.
+	writtenStates nodestatus.WrittenStates
 }
 
 // rejection is a conflict of a profile which got reported.
@@ -234,7 +237,7 @@ func (r *Reconciler) Reconcile(
 		// observed, or after the usually very long reconcile timeout
 		// configured for the controller manager)
 		return reconcile.Result{}, common.ReleaseUnsupported(
-			ctx, r.client, r.reader, profile, r.nodeName,
+			ctx, r.client, r.reader, profile, r.nodeName, &r.writtenStates,
 		)
 	}
 
@@ -242,6 +245,7 @@ func (r *Reconciler) Reconcile(
 	if found, err := common.GetProfile(ctx, r.client, req.NamespacedName, appArmorProfile); !found {
 		if err == nil {
 			r.forgetProfile(req.NamespacedName)
+			r.writtenStates.Forget(req.NamespacedName)
 			// The error series of a profile which is gone would stay
 			// around for the lifetime of the daemon otherwise.
 			r.metrics.DeleteAppArmorProfileErrors(req.Name)
@@ -262,6 +266,7 @@ func (r *Reconciler) reconcileAppArmorProfile(
 	}
 
 	nodeStatus.WithAPIReader(r.reader)
+	nodeStatus.WithWrittenStates(&r.writtenStates)
 
 	if !sp.GetDeletionTimestamp().IsZero() { // object is being deleted
 		r.forgetProfile(client.ObjectKeyFromObject(sp))
@@ -355,9 +360,9 @@ func (r *Reconciler) rejectProfile(
 }
 
 // installProfile loads the profile into the kernel and records on the node
-// status that this node installed it. A failed installation returns an
-// error, so the controller retries it with the exponential backoff of its
-// rate limiter.
+// status that this node installed it. A failed installation sets the node
+// status to error and returns an error, so the controller retries it with the
+// exponential backoff of its rate limiter.
 func (r *Reconciler) installProfile(
 	ctx context.Context,
 	sp *apparmorprofileapi.AppArmorProfile,
@@ -376,6 +381,18 @@ func (r *Reconciler) installProfile(
 		return fmt.Errorf("getting status for installed AppArmorProfile: %w", err)
 	}
 
+	// A failed installation sets the status to error, the annotation tells
+	// the installation then.
+	ownedByUs := isAlreadyInstalled
+	if !ownedByUs {
+		installed, err := nodeStatus.GetAnnotation(ctx, installedAnnotation)
+		if err != nil {
+			return fmt.Errorf("checking if the profile was installed on this node: %w", err)
+		}
+
+		ownedByUs = installed == "true"
+	}
+
 	r.warnDeprecatedPtraceRules(sp, l)
 	r.warnTraversalPaths(sp, l)
 
@@ -385,7 +402,7 @@ func (r *Reconciler) installProfile(
 		return fmt.Errorf("cannot load profile into node: %w", ErrOperatorProfile)
 	}
 
-	updated, err := r.manager.InstallProfile(sp, isAlreadyInstalled)
+	updated, err := r.manager.InstallProfile(sp, ownedByUs)
 	if isRejection(err) {
 		// Reported by rejectProfile.
 		return fmt.Errorf("cannot load profile into node: %w", err)
@@ -395,7 +412,7 @@ func (r *Reconciler) installProfile(
 		l.Error(err, "cannot load profile into node")
 		r.reportError(sp, reasonCannotLoadProfile, util.EventActionInstall, err)
 
-		return fmt.Errorf("cannot load profile into node: %w", err)
+		return r.failInstallation(ctx, sp, nodeStatus, isAlreadyInstalled, err)
 	}
 
 	// A profile which is installed already gets loaded again when its policy
@@ -413,6 +430,38 @@ func (r *Reconciler) installProfile(
 	}
 
 	return nil
+}
+
+// failInstallation sets the node status of a profile which failed to load to
+// error. The previous policy of a profile which is installed already stays
+// loaded. Its installation gets recorded first, a status of an earlier release
+// only tells it by its state, which the error replaces.
+func (r *Reconciler) failInstallation(
+	ctx context.Context,
+	sp *apparmorprofileapi.AppArmorProfile,
+	nodeStatus *nodestatus.StatusClient,
+	recordInstalled bool,
+	installErr error,
+) error {
+	if recordInstalled {
+		if err := nodeStatus.SetAnnotation(ctx, installedAnnotation, "true"); err != nil {
+			r.reportError(sp, common.ReasonCannotUpdateStatus, util.EventActionUpdate, err)
+
+			return fmt.Errorf("recording profile installation: %w", err)
+		}
+	}
+
+	if err := nodeStatus.SetNodeStatusWithMessage(
+		ctx,
+		secprofnodestatusapi.ProfileStateError,
+		installErr.Error(),
+	); err != nil {
+		r.reportError(sp, common.ReasonCannotUpdateStatus, util.EventActionUpdate, err)
+
+		return fmt.Errorf("setting node status to error: %w", err)
+	}
+
+	return fmt.Errorf("cannot load profile into node: %w", installErr)
 }
 
 // reportLoaded counts a loaded policy in the update metric and records an

@@ -117,11 +117,10 @@ enricher should be listening for new changes to the audit logs:
 
 ```
 > kubectl -n security-profiles-operator logs -f ds/spod log-enricher
-setup "msg"="starting component: log-enricher"  "buildDate"="1980-01-01T00:00:00Z" "compiler"="gc" "gitCommit"="unknown" "gitTreeState"="clean" "goVersion"="go1.16.2" "platform"="linux/amd64" "version"="<version>"
-log-enricher "msg"="Starting log-enricher on node: 127.0.0.1"
+…
+log-enricher "msg"="Starting log-enricher on node" "node"="127.0.0.1"
 log-enricher "msg"="Connecting to local GRPC server"
-log-enricher "msg"="Reading from file /var/log/audit/audit.log"
-2021/06/23 12:51:04 Sought /var/log/audit/audit.log - &{Offset:0 Whence:2}
+log-enricher "msg"="Starting GRPC server API"
 ```
 
 To record by using the log enricher, create a `ProfileRecording` which is using
@@ -205,7 +204,7 @@ enabled. You can find out if your SPO build has the eBPF feature disabled by
 looking at the build tags:
 
 ```
-> kubectl logs --selector name=security-profiles-operator | grep buildTags
+> kubectl -n security-profiles-operator logs --selector name=security-profiles-operator --tail=-1 | grep buildTags
 ```
 
 If the output contains `no_bpf` then the feature has been disabled.
@@ -225,30 +224,29 @@ We can verify that the recorder is up and running after the spod rollout has
 been finished:
 
 ```
-> kubectl -n security-profiles-operator logs --selector name=spod -c bpf-recorder
-Found 6 pods, using pod/spod-h7dpm
-"msg"="Set logging verbosity to 0"
-setup "msg"="starting component: bpf-recorder"  "buildDate"="1980-01-01T00:00:00Z" "compiler"="gc" "gitCommit"="unknown" "gitTreeState"="clean" "goVersion"="go1.16.9" "libseccomp"="2.5.1" "platform"="linux/amd64" "version"="<version>"
-bpf-recorder "msg"="Setting up caches with expiry of 1h0m0s"
-bpf-recorder "msg"="Starting log-enricher on node: ip-10-0-228-234.us-east-2.compute.internal"
+> kubectl -n security-profiles-operator logs --selector name=spod -c bpf-recorder --tail=-1
+…
+bpf-recorder "msg"="Setting up caches" "expiry"="1h0m0s"
+bpf-recorder "msg"="Starting ebpf recorder on node" "node"="ip-10-0-228-234.us-east-2.compute.internal"
 bpf-recorder "msg"="Connecting to metrics server"
 bpf-recorder "msg"="Got system mount namespace: 4026531840"
-bpf-recorder "msg"="Doing BPF load/unload self-test"
-bpf-recorder "msg"="Loading bpf module"
+bpf-recorder "msg"="Loading BPF program"
+bpf-recorder "msg"="Loading bpf module..."
 bpf-recorder "msg"="Using system btf file"
 bpf-recorder "msg"="Loading bpf object from module"
-bpf-recorder "msg"="Getting bpf program sys_enter"
-bpf-recorder "msg"="Attaching bpf tracepoint"
+bpf-recorder "msg"="Excluding mount namespace" "mntns"=4026531840
 bpf-recorder "msg"="Getting syscalls map"
-bpf-recorder "msg"="Getting comms map"
-bpf-recorder "msg"="Module successfully loaded, watching for events"
-bpf-recorder "msg"="Unloading bpf module"
+bpf-recorder "msg"="BPF module successfully loaded."
+bpf-recorder "msg"="Doing BPF start/stop self-test..."
+…
+bpf-recorder "msg"="BPF start/stop self-test successful."
 bpf-recorder "msg"="Starting GRPC API server"
 ```
 
 The recorder does a system sanity check on startup to ensure everything works as
-expected. This includes a `load` and `unload` of the BPF module. If this fails,
-please open an issue so that we can find out what went wrong.
+expected. This includes loading the BPF module and starting and stopping a
+recording. If this fails, please open an issue so that we can find out what went
+wrong.
 
 To record seccomp profiles by using the BPF recorder, create a
 `ProfileRecording` which is using `recorder: Bpf`:
@@ -287,18 +285,6 @@ If the pod is up and running:
 > kubectl get pods
 NAME     READY   STATUS    RESTARTS   AGE
 my-pod   1/1     Running   0          10s
-```
-
-Then the BPF recorder should indicate that it found the container:
-
-```
-> kubectl -n security-profiles-operator logs --since=1m --selector name=spod -c bpf-recorder
-…
-bpf-recorder "msg"="Found container ID in cluster"  "containerID"="c2e10af47011f6a61cd7e92073db2711796f174af35b34486967588ef7f95fbc" "containerName"="nginx"
-bpf-recorder "msg"="Saving PID for profile"  "mntns"=4026533352 "pid"=74384 "profile"="my-recording-nginx-1636978341"
-bpf-recorder "msg"="Using short path via tracked mount namespace"  "mntns"=4026533352 "pid"=74403 "profile"="my-recording-nginx-1636978341"
-bpf-recorder "msg"="Using short path via tracked mount namespace"  "mntns"=4026533352 "pid"=74402 "profile"="my-recording-nginx-1636978341"
-…
 ```
 
 Now, if we remove the pod:
@@ -685,9 +671,11 @@ which is added by the kubectl client.
 
 Because this label might vary across different Kubernetes client implementations
 (e.g., oc debug in OpenShift uses `debug.openshift.io/managed-by: "oc-debug"`),
-you may need to configure additional `webhook.options` entries to ensure the webhook catches all relevant debug pods.
+you may need to change the `objectSelector` of the webhook in its `webhook.options` entry. There is one entry per
+webhook, and its `objectSelector` replaces the default one. A label selector requires all of its labels, so the
+webhook then catches the pods of the new selector instead of the ones of `kubectl debug`.
 
-For example, to include `oc debug pods`:
+For example, to catch `oc debug` pods instead:
 
 ```yaml
 # ... (rest of your spod configuration)
@@ -698,10 +686,9 @@ spec:
         objectSelector:
           matchLabels: # Use matchLabels for exact matching
             debug.openshift.io/managed-by: "oc-debug"
-# ... other webhook rule details like rules, clientConfig, etc.
 ```
 
-Reference: For more details on the label, see: https://github.com/kubernetes/kubernetes/pull/131791
+Reference: For more details on the label, see <https://github.com/kubernetes/kubernetes/pull/131791>.
 
 ### AppArmor Profile
 
@@ -744,24 +731,22 @@ We can verify that the recorder is up and running after the spod rollout has
 been finished:
 
 ```
-> kubectl -n security-profiles-operator logs --selector name=spod -c bpf-recorder
-Found 6 pods, using pod/spod-h7dpm
-"msg"="Set logging verbosity to 0"
-setup "msg"="starting component: bpf-recorder"  "buildDate"="1980-01-01T00:00:00Z" "compiler"="gc" "gitCommit"="unknown" "gitTreeState"="clean" "goVersion"="go1.16.9" "libseccomp"="2.5.1" "platform"="linux/amd64" "version"="<version>"
-bpf-recorder "msg"="Setting up caches with expiry of 1h0m0s"
-bpf-recorder "msg"="Starting log-enricher on node: ip-10-0-228-234.us-east-2.compute.internal"
+> kubectl -n security-profiles-operator logs --selector name=spod -c bpf-recorder --tail=-1
+…
+bpf-recorder "msg"="Setting up caches" "expiry"="1h0m0s"
+bpf-recorder "msg"="Starting ebpf recorder on node" "node"="ip-10-0-228-234.us-east-2.compute.internal"
 bpf-recorder "msg"="Connecting to metrics server"
 bpf-recorder "msg"="Got system mount namespace: 4026531840"
-bpf-recorder "msg"="Doing BPF load/unload self-test"
-bpf-recorder "msg"="Loading bpf module"
+bpf-recorder "msg"="Loading BPF program"
+bpf-recorder "msg"="Loading bpf module..."
 bpf-recorder "msg"="Using system btf file"
 bpf-recorder "msg"="Loading bpf object from module"
-bpf-recorder "msg"="Getting bpf program sys_enter"
-bpf-recorder "msg"="Attaching bpf tracepoint"
+bpf-recorder "msg"="Excluding mount namespace" "mntns"=4026531840
 bpf-recorder "msg"="Getting syscalls map"
-bpf-recorder "msg"="Getting comms map"
-bpf-recorder "msg"="Module successfully loaded, watching for events"
-bpf-recorder "msg"="Unloading bpf module"
+bpf-recorder "msg"="BPF module successfully loaded."
+bpf-recorder "msg"="Doing BPF start/stop self-test..."
+…
+bpf-recorder "msg"="BPF start/stop self-test successful."
 bpf-recorder "msg"="Starting GRPC API server"
 ```
 
@@ -908,11 +893,27 @@ In particular, the `SelinuxProfile` kind:
 - performs basic validation of the permissions, classes and labels
 - allows to restrict the SELinux types, classes and permissions which can be used in the profiles by
   `spec.selinux.options.deniedTypes`, `deniedClasses` and `deniedPermissions` of the `spod` instance. The
-  operator also denies some of them by default, and `allowedTypes`, `allowedClasses` and `allowedPermissions`
-  remove entries from that built-in denylist. Use the latter with care, because they relax a safe default for
-  every profile. The lists are compared by name, so the CIL keywords `all`, `and`, `not`, `or`, `range` and
-  `xor` are rejected as permissions, and allowing a type attribute like `file_type` is not rejected, although
-  it contains denied types.
+  operator also denies some of them by default, for example the `transition` and `dyntransition` permissions
+  which would let a container switch into another domain, and `allowedTypes`, `allowedClasses` and
+  `allowedPermissions` remove entries from that built-in denylist. Use the latter with care, because they relax
+  a safe default for every profile. The lists are compared by name, so the CIL keywords `all`, `and`, `not`,
+  `or`, `range` and `xor` are rejected as permissions. An allow rule on a type attribute like `file_type` is not
+  rejected either, although the attribute contains denied types, and grants access to them. To stop that, add
+  the attribute to `deniedTypes`, which denies attributes by their name as well.
+
+  The kernel memory types `memory_device_t` of `/dev/mem`, `/dev/kmem` and `/dev/port` and `proc_kcore_t` of
+  `/proc/kcore` are not denied by default, which would break existing profiles. They are recommended
+  `deniedTypes`, together with the `device_node` attribute, which contains `memory_device_t`:
+
+  ```yaml
+  spec:
+    selinux:
+      options:
+        deniedTypes:
+          - device_node
+          - memory_device_t
+          - proc_kcore_t
+  ```
 - adds a new keyword `@self` that describes the process using the policy. This allows to reuse a policy between
   workloads and namespaces easily, as the "usage" of the policy (see below) is based on the profile name.
 
@@ -954,7 +955,7 @@ The CIL-formatted policies are placed into an `emptyDir` owned by the SPO where 
 the resulting CIL policy:
 
 ```shell
-$ kubectl exec -it -c selinuxd spod-fm55x -- sh
+$ kubectl -n security-profiles-operator exec -it -c selinuxd spod-fm55x -- sh
 sh-4.4# cat /etc/selinux.d/nginx-secure.cil
 (block nginx-secure
 (blockinherit container)
@@ -979,6 +980,17 @@ by setting `.spec.mode` to `Permissive`. This mode might be useful e.g. when
 the policy is known or suspected to be incomplete and you'd prefer to just
 watch for subsequent AVC denials after deploying the policy.
 
+A permissive domain gets every access it asks for, including the types, classes and permissions which the
+`spod` instance denies. To keep the profiles from bypassing the denylist this way, reject permissive profiles:
+
+```shell
+kubectl -n security-profiles-operator patch spod spod --type=merge \
+  -p '{"spec":{"selinux":{"options":{"allowPermissiveProfiles":false}}}}'
+```
+
+A permissive profile and every profile which inherits from it then fail validation and report an error, so they
+are neither installed nor updated. A policy which a node loaded already stays loaded until the profile is deleted.
+
 #### Record SELinux profile
 
 The SELinux profiles can be recorded using the log enricher. You should make sure that it is enabled:
@@ -999,11 +1011,10 @@ enricher should be listening for new changes to the audit logs:
 
 ```
 > kubectl -n security-profiles-operator logs -f ds/spod log-enricher
-setup "msg"="starting component: log-enricher"  "buildDate"="1980-01-01T00:00:00Z" "compiler"="gc" "gitCommit"="unknown" "gitTreeState"="clean" "goVersion"="go1.16.2" "platform"="linux/amd64" "version"="<version>"
-log-enricher "msg"="Starting log-enricher on node: 127.0.0.1"
+…
+log-enricher "msg"="Starting log-enricher on node" "node"="127.0.0.1"
 log-enricher "msg"="Connecting to local GRPC server"
-log-enricher "msg"="Reading from file /var/log/audit/audit.log"
-2021/06/23 12:51:04 Sought /var/log/audit/audit.log - &{Offset:0 Whence:2}
+log-enricher "msg"="Starting GRPC server API"
 ```
 
 Record the workload in its own namespace, not in the privileged operator
@@ -1192,13 +1203,19 @@ kubectl -n security-profiles-operator patch spod spod --type=merge -p '{"spec":{
 #### Base syscalls for a container runtime
 
 An example of the minimum required syscalls for a runtime such as
-[runc](https://github.com/opencontainers/runc) (recorded with version 1.5.2) to
-launch a container can be found in [the
-examples](../examples/baseprofile-runc.yaml). You can use this example as a
-starting point for creating custom profiles for your application. You can also
+[runc](https://github.com/opencontainers/runc) to launch a container can be
+found in [the examples](../examples/baseprofile-runc.yaml). It is named after
+the runc version it was recorded with. You can use this example as a starting
+point for creating custom profiles for your application. You can also
 programmatically combine it with your custom profiles in order to build
 application-specific profiles that only specify syscalls that are required on
-top of the base calls needed for the container runtime. For example:
+top of the base calls needed for the container runtime. The operator does not
+ship the base profiles, so apply the example first, then refer to it by its
+name. For example:
+
+```shell
+kubectl apply -f examples/baseprofile-runc.yaml
+```
 
 ```yaml
 apiVersion: security-profiles-operator.x-k8s.io/v1
@@ -1216,8 +1233,7 @@ spec:
 
 If you're not using runc but the alternative
 [crun](https://github.com/containers/crun), then you can do the same by using
-the [corresponding example profile](../examples/baseprofile-crun.yaml) (recorded
-with version 1.30.1).
+the [corresponding example profile](../examples/baseprofile-crun.yaml).
 
 #### Recording profiles without applying them
 
@@ -1261,7 +1277,6 @@ OCI artifacts, which are right now:
 - [Amazon Elastic Container Registry](https://aws.amazon.com/ecr)
 - [Google Artifact Registry](https://cloud.google.com/artifact-registry)
 - [GitHub Packages container registry](https://docs.github.com/en/packages/guides/about-github-container-registry)
-- [Bundle Bar](https://bundle.bar/docs/supported-clients/oras)
 - [Docker Hub](https://hub.docker.com)
 - [Zot Registry](https://zotregistry.io)
 
@@ -1522,7 +1537,15 @@ security context of a pod cannot be changed after its creation.
   new containers.
 - A binding always replaces a security context value of the pod author, so
   that the bound profile cannot be weakened, for example with
-  `type: Unconfined`. For the same reason, the deprecated
+  `type: Unconfined`. A `ProfileRecording` with the `Logs` recorder would
+  replace the bound seccomp profile or SELinux type of a container with the
+  ones of the recording, so it does not record the containers which a
+  binding of the same kind binds. The pod is admitted with an admission
+  warning and the recording gets a `ContainerBound` event. A binding which
+  got applied to the pod, but which the webhook replica does not know yet,
+  counts as binding every container of the pod. The `Bpf` recorder
+  does not change the security context and records these containers with
+  their bound profile. For the same reason, the deprecated
   `container.apparmor.security.beta.kubernetes.io/<container>` annotations of
   the containers an AppArmorProfile gets bound to are removed. The API server
   rejects pods whose deprecated seccomp annotations do not match the seccomp
@@ -1553,7 +1576,9 @@ security context of a pod cannot be changed after its creation.
   unless the profile kind is disabled in the SPOD configuration. Then the
   binding is skipped and gets a `ProfileWithoutStatus` event. A pod bound to a
   profile with the `Partial` status of a recording which is not merged yet is
-  rejected as well, because the nodes never install partial profiles.
+  rejected as well, because the nodes never install partial profiles. So is a
+  pod bound to a profile which is being deleted and which no pod uses, because
+  the nodes remove it.
 - Windows pods are never mutated, because the API server rejects seccomp,
   SELinux and AppArmor settings on them.
 

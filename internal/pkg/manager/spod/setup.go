@@ -211,6 +211,11 @@ func (r *ReconcileSPOd) Setup(
 
 	r.skipAdmissionPolicies = !servesPolicies
 
+	r.spodPolicies, err = bindata.GetSpodAdmissionPolicies(r.namespace)
+	if err != nil {
+		return fmt.Errorf("get spod admission policies: %w", err)
+	}
+
 	if servesPolicies {
 		isAdmissionPolicy := builder.WithPredicates(predicate.NewPredicateFuncs(
 			func(obj client.Object) bool { return bindata.IsAdmissionPolicyName(obj.GetName()) },
@@ -457,7 +462,9 @@ func (r *ReconcileSPOd) getTunables(ctx context.Context) (*daemonTunables, error
 	var err error
 
 	dt := &daemonTunables{}
-	dt.watchNamespace = os.Getenv(config.RestrictNamespaceEnvKey)
+	// The daemons watch the same namespaces as the manager, which includes
+	// the WATCH_NAMESPACE set by OLM.
+	dt.watchNamespace = config.WatchNamespaces()
 
 	dt.maxMetricSeries, err = maxMetricSeries()
 	if err != nil {

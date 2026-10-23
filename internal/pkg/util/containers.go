@@ -24,6 +24,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,11 @@ var (
 	// ContainerIDRegex is the regular expression for determining the 64 digit
 	// container ID.
 	ContainerIDRegex = regexp.MustCompile(`[0-9a-f]{64}`)
+
+	// cgroupContainerIDRegex matches the container IDs in a cgroup path, with
+	// the prefix of the scope of conmon, the monitor of CRI-O for the
+	// container, which runs next to it.
+	cgroupContainerIDRegex = regexp.MustCompile(`(crio-conmon-)?([0-9a-f]{64})`)
 
 	// ErrProcessNotFound is the error returned by ContainerIDForPID if the
 	// process path could not be found in /proc.
@@ -111,7 +117,9 @@ func ContainerIDForPID(cache *ttlcache.Cache[string, string], pid int) (string, 
 
 // ContainerIDAndStartTimeForPID is ContainerIDForPID which also returns when
 // the process started, like ProcessStartTime. The start time is the one the
-// container got looked up for, read only once.
+// container got looked up for, read only once. It is returned along with
+// ErrContainerIDNotFound as well, which tells whether the process outside of
+// any container is the one the caller looks for.
 func ContainerIDAndStartTimeForPID(
 	cache *ttlcache.Cache[string, string], pid int,
 ) (containerID string, started time.Duration, err error) {
@@ -141,6 +149,10 @@ func containerIDAndStartTimeForPID(
 	}
 
 	containerID, err = containerIDForStartTime(cache, pid, startTime, cgroupReader)
+	if errors.Is(err, ErrContainerIDNotFound) {
+		return "", started, err
+	}
+
 	if err != nil {
 		return "", 0, err
 	}
@@ -182,9 +194,7 @@ func containerIDForStartTime(
 	for scanner.Scan() {
 		text := scanner.Text()
 
-		if containerIDs := ContainerIDRegex.FindAllString(text, -1); 0 < len(containerIDs) {
-			// Using the last container ID in the cgroup path to support "docker in docker" use cases
-			containerID := containerIDs[len(containerIDs)-1]
+		if containerID := ContainerIDFromCgroup(text); containerID != "" {
 			cache.Set(cacheKey, containerID, ttlcache.DefaultTTL)
 
 			return containerID, nil
@@ -198,6 +208,20 @@ func containerIDForStartTime(
 	cache.Set(cacheKey, "", noContainerTimeout)
 
 	return "", ErrContainerIDNotFound
+}
+
+// ContainerIDFromCgroup returns the container ID of a process in the cgroup
+// path, or an empty string if it runs outside of a container. It is the last
+// one in the path, to support "docker in docker" use cases. The ID in the
+// scope of conmon does not count, conmon is no process of the container.
+func ContainerIDFromCgroup(path string) string {
+	for _, match := range slices.Backward(cgroupContainerIDRegex.FindAllStringSubmatch(path, -1)) {
+		if match[1] == "" {
+			return match[2]
+		}
+	}
+
+	return ""
 }
 
 // getProcessStartTimeTicks returns the start time of a process in clock

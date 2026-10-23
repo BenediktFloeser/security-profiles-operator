@@ -100,7 +100,11 @@ func newReconcileTest(
 
 	recorder := events.NewFakeRecorder(100)
 
+	spodPolicies, err := bindata.GetSpodAdmissionPolicies(testNamespace)
+	require.NoError(t, err)
+
 	return &ReconcileSPOd{
+		spodPolicies: spodPolicies,
 		client:       cl,
 		clientReader: cl,
 		scheme:       scheme,
@@ -407,6 +411,118 @@ func TestReconcileAdmissionPolicyFollowsStaticWebhook(t *testing.T) {
 		reconcileUntilRunning(t, r, cl)
 
 		require.NotContains(t, policyExpression(t, cl), "from-options")
+	})
+}
+
+// The reconciliation creates the spod admission policies, which nothing
+// watches, so it repeats after bindata.SpodPolicyResync.
+func TestReconcileAppliesSpodAdmissionPolicies(t *testing.T) {
+	t.Parallel()
+
+	isSpodPolicy := func(obj client.Object) bool {
+		_, ok := obj.(*admissionregv1.ValidatingAdmissionPolicy)
+
+		return ok && strings.HasPrefix(obj.GetName(), "spo-spod-")
+	}
+
+	request := reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: config.SPOdName, Namespace: testNamespace},
+	}
+
+	t.Run("created", func(t *testing.T) {
+		t.Parallel()
+
+		spod := testSPOD()
+		spod.Status.StatePending()
+
+		r, cl, _ := newReconcileTest(t, spod, &interceptor.Funcs{})
+
+		res, err := r.Reconcile(t.Context(), request)
+		require.NoError(t, err)
+		require.Equal(t, reconcile.Result{RequeueAfter: bindata.SpodPolicyResync}, res)
+
+		for _, name := range bindata.SpodAdmissionPolicyNames {
+			key := client.ObjectKey{Name: name}
+			require.NoError(
+				t,
+				cl.Get(t.Context(), key, &admissionregv1.ValidatingAdmissionPolicy{}),
+			)
+			require.NoError(
+				t,
+				cl.Get(t.Context(), key, &admissionregv1.ValidatingAdmissionPolicyBinding{}),
+			)
+		}
+
+		// Without the API, no reconciliation repeats for the policies.
+		r.skipAdmissionPolicies = true
+
+		res, err = r.Reconcile(t.Context(), request)
+		require.NoError(t, err)
+		require.Zero(t, res)
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		t.Parallel()
+
+		spod := testSPOD()
+		spod.Status.StatePending()
+
+		fail := true
+		r, cl, recorder := newReconcileTest(t, spod, &interceptor.Funcs{
+			Create: func(
+				ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption,
+			) error {
+				if isSpodPolicy(obj) && fail {
+					return errTest
+				}
+
+				return c.Create(ctx, obj, opts...)
+			},
+		})
+
+		res, err := r.Reconcile(t.Context(), request)
+		require.ErrorIs(t, err, errAdmissionPoliciesFailed)
+		require.ErrorIs(t, err, errTest)
+		require.Zero(t, res)
+		require.Contains(t, <-recorder.Events, reasonCannotApplyAdmissionPolicies)
+
+		// The failure is not remembered as applied.
+		fail = false
+
+		reconcileSPOD(t, r)
+		require.NoError(t, cl.Get(t.Context(),
+			client.ObjectKey{Name: bindata.SpodAdmissionPolicyNames[0]},
+			&admissionregv1.ValidatingAdmissionPolicy{}))
+	})
+
+	t.Run("api not served", func(t *testing.T) {
+		t.Parallel()
+
+		spod := testSPOD()
+		spod.Status.StatePending()
+
+		r, _, recorder := newReconcileTest(t, spod, &interceptor.Funcs{
+			Get: func(
+				ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object,
+				opts ...client.GetOption,
+			) error {
+				if isSpodPolicy(obj) {
+					return &meta.NoKindMatchError{
+						GroupKind: admissionregv1.SchemeGroupVersion.WithKind("ValidatingAdmissionPolicy").
+							GroupKind(),
+					}
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		})
+
+		_, err := r.Reconcile(t.Context(), request)
+		require.NoError(t, err)
+
+		for len(recorder.Events) > 0 {
+			require.NotContains(t, <-recorder.Events, reasonCannotApplyAdmissionPolicies)
+		}
 	})
 }
 
@@ -1403,4 +1519,38 @@ func TestReconcileWarnsAboutIgnoredSelinuxTypeTag(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The daemons write the default profile at the same time, so an update of its
+// spec which conflicts gets retried. Only the reconciliation which updates the
+// DaemonSet updates the spec, so it would keep the spec of the old release.
+func TestSyncDefaultProfilesRetriesConflict(t *testing.T) {
+	t.Parallel()
+
+	old := bindata.DefaultLogEnricherProfile()
+	old.Spec.DefaultAction = seccompprofileapi.ActAllow
+
+	var updates atomic.Int32
+
+	spod := testSPOD()
+	spod.Spec.Enricher.EnableLogEnricher = new(true)
+
+	r, cl, _ := newReconcileTest(t, spod, &interceptor.Funcs{
+		Update: func(
+			ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption,
+		) error {
+			if _, ok := obj.(*seccompprofileapi.SeccompProfile); ok && updates.Add(1) == 1 {
+				return apierrors.NewConflict(schema.GroupResource{}, obj.GetName(), errTest)
+			}
+
+			return c.Update(ctx, obj, opts...)
+		},
+	}, old)
+
+	require.NoError(t, r.syncDefaultProfiles(t.Context(), spod, true))
+	require.Equal(t, int32(2), updates.Load())
+
+	found := &seccompprofileapi.SeccompProfile{}
+	require.NoError(t, cl.Get(t.Context(), client.ObjectKeyFromObject(old), found))
+	require.Equal(t, bindata.DefaultLogEnricherProfile().Spec, found.Spec)
 }

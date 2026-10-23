@@ -20,10 +20,13 @@ set -euo pipefail
 # profiles in examples. The published profile artifact is platform
 # independent, so a single profile lists every recorded architecture and the
 # union of their syscalls. Runtimes skip syscalls that do not exist on the
-# architecture they run on. Fails if the result differs from the committed
-# profiles.
+# architecture they run on. The syscalls of the committed profile are kept, a
+# recording only adds to them: on the kernel of the runner, a runtime may
+# leave out a syscall that it still needs on older kernels. The syscalls that no
+# recording holds anymore get logged. Fails if the result differs from the
+# committed profiles.
 update_base_profiles() {
-  local recordings=$1 runtime profile versions merged
+  local recordings=$1 runtime profile versions committed merged
   local files=()
 
   for runtime in runc crun; do
@@ -38,13 +41,18 @@ update_base_profiles() {
       exit 1
     fi
 
-    merged=$(jq -sc '{
+    committed=$(yq -o json -I 0 '.spec.syscalls // []' "$profile")
+    merged=$(jq -sc --argjson committed "$committed" '{
       architectures: ([.[].architectures[]] | unique),
-      syscalls: ([.[].syscalls[]] | group_by(.action) | map({
+      syscalls: ([.[].syscalls[]] + $committed | group_by(.action) | map({
         action: .[0].action,
         names: ([.[].names[]] | unique)
       }))
     }' "${files[@]}")
+
+    jq -rs --argjson committed "$committed" '
+      [$committed[].names[]] - [.[].syscalls[].names[]] | unique | .[]
+    ' "${files[@]}" | sed 's/^/Not recorded anymore: /'
 
     yq -i "
       .metadata.name = \"$runtime-v$versions\" |
@@ -65,16 +73,11 @@ update_base_profiles() {
   # that uses `setns` to join the container mount namespace.
   # As a consequence, we sometimes get all the funny syscalls emitted
   # by the Go runtime, which we need to ignore.
+  # The pattern matches whole list entries, so that syscalls which only start
+  # with one of these names, like exit_group or epoll_pwait2, still count.
   echo "Diffing output while ignoring flaky syscalls"
   git diff --exit-code -U0 \
-    -I rt_sigreturn \
-    -I sched_yield \
-    -I tgkill \
-    -I exit \
-    -I madvise \
-    -I rt_sigprocmask \
-    -I sigaltstack \
-    -I epoll_pwait \
+    -I '^ *- (rt_sigreturn|sched_yield|tgkill|exit|madvise|rt_sigprocmask|sigaltstack|epoll_pwait)$' \
     examples
 }
 

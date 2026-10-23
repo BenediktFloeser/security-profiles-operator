@@ -709,6 +709,56 @@ func TestObject2CIL(t *testing.T) {
 	}
 }
 
+func TestObject2CILPermissive(t *testing.T) {
+	t.Parallel()
+
+	sp := &selinuxprofileapi.SelinuxProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+		Spec: selinuxprofileapi.SelinuxProfileSpec{
+			Mode: selinuxprofileapi.SelinuxModePermissive,
+		},
+	}
+
+	for _, opts := range []*Options{nil, {}} {
+		policy, err := Object2CIL(nil, nil, sp, opts)
+		require.NoError(t, err)
+		require.Contains(t, policy, typePermissive)
+	}
+
+	policy, err := Object2CIL(nil, nil, sp, &Options{DenyPermissive: true})
+	require.ErrorIs(t, err, ErrPermissiveNotAllowed)
+	require.Empty(t, policy)
+}
+
+// The kernel memory types are not denied by default, which would break
+// existing profiles, but the SPOD can deny them and the attributes which
+// contain them, like device_node, by name.
+func TestObject2CILKernelMemoryTypes(t *testing.T) {
+	t.Parallel()
+
+	profile := func(ttype string) *selinuxprofileapi.SelinuxProfile {
+		return &selinuxprofileapi.SelinuxProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+			Spec: selinuxprofileapi.SelinuxProfileSpec{
+				Allow: selinuxprofileapi.Allow{
+					selinuxprofileapi.LabelKey(ttype): {"chr_file": {"read"}},
+				},
+			},
+		}
+	}
+
+	_, err := Object2CIL(nil, nil, profile("kmem_t"), nil)
+	require.ErrorContains(t, err, "type kmem_t is denied")
+
+	for _, ttype := range []string{"memory_device_t", "proc_kcore_t", "device_node"} {
+		_, err := Object2CIL(nil, nil, profile(ttype), nil)
+		require.NoError(t, err)
+
+		_, err = Object2CIL(nil, nil, profile(ttype), &Options{DeniedTypes: []string{ttype}})
+		require.ErrorContains(t, err, "type "+ttype+" is denied")
+	}
+}
+
 func TestObject2CILRejectsInvalidIdentifiers(t *testing.T) {
 	t.Parallel()
 
@@ -845,6 +895,32 @@ func TestObject2CILUserNamespaceCapabilities(t *testing.T) {
 		DeniedClasses: []string{"cap_userns", "cap2_userns"},
 	})
 	require.ErrorContains(t, err, "class cap_userns is denied")
+}
+
+// A transition into another domain escapes the profile, so it is denied by
+// default, and the SPOD can allow it.
+func TestObject2CILProcessTransitions(t *testing.T) {
+	t.Parallel()
+
+	for _, perm := range []string{"transition", "dyntransition"} {
+		sp := &selinuxprofileapi.SelinuxProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+			Spec: selinuxprofileapi.SelinuxProfileSpec{
+				Allow: selinuxprofileapi.Allow{
+					"spc_t": {"process": {perm}},
+				},
+			},
+		}
+
+		_, err := Object2CIL([]string{"container"}, nil, sp, nil)
+		require.ErrorContains(t, err, "permission "+perm+" is denied")
+
+		got, err := Object2CIL([]string{"container"}, nil, sp, &Options{
+			AllowedPermissions: []string{perm},
+		})
+		require.NoError(t, err)
+		require.Contains(t, got, "(allow process spc_t ( process ( "+perm+" )))\n")
+	}
 }
 
 // CIL resolves names with leading dots to the global namespace, so they must

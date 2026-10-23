@@ -145,24 +145,16 @@ as an artifact, and can be installed by executing the following shell commands:
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
 kubectl --namespace cert-manager wait --for condition=available deployment --all
 
-# Create the namespace beforehand
+# Create the namespace beforehand, the chart does not manage it. The daemon
+# runs privileged, so the namespace needs the privileged Pod Security
+# Standard.
 export spo_ns=security-profiles-operator
 kubectl create ns $spo_ns
-
-# Label and annotate the ns to make it manageable by helm. Ensure it is
-# running on the privileged Pod Security Standard.
 kubectl label ns $spo_ns \
-  app=security-profiles-operator \
   pod-security.kubernetes.io/audit=privileged \
   pod-security.kubernetes.io/enforce=privileged \
   pod-security.kubernetes.io/warn=privileged \
-  app.kubernetes.io/managed-by=Helm \
   --overwrite=true
-
-kubectl annotate ns $spo_ns \
-  "meta.helm.sh/release-name"="security-profiles-operator" \
-  "meta.helm.sh/release-namespace"="$spo_ns" \
-  --overwrite
 
 # Install the chart from the release URL (or a file path if desired).
 # Replace $VERSION with the desired release version. The chart archive is
@@ -172,7 +164,10 @@ helm install security-profiles-operator --namespace security-profiles-operator h
 # helm upgrade --install security-profiles-operator --namespace security-profiles-operator https://github.com/kubernetes-sigs/security-profiles-operator/releases/download/v${VERSION}/security-profiles-operator-${VERSION}.tgz
 ```
 
-You may also specify a different target namespace with `--namespace mynamespace` or `--namespace mynamespace --create-namespace` if it still doesn't exist.
+You may also specify a different target namespace with `--namespace mynamespace`.
+Create and label it as shown above. `--create-namespace` creates it without
+the Pod Security labels, so the admission rejects the privileged pods of the
+daemon unless the cluster allows them by default.
 
 To verify a downloaded chart archive before installing it, see
 [verifying the released artifacts](verification.md#helm-chart).
@@ -256,7 +251,7 @@ place, the same procedure removes them afterwards.
 
 ### Installation on AKS
 
-In case you installed SPO on an [AKS cluster](https://azure.microsoft.com/en-us/products/kubernetes-service/#overview), it is recommended to [configure webhook](#configuring-webhooks) to respect the [control-plane](https://learn.microsoft.com/en-us/azure/aks/faq#can-i-use-admission-controller-webhooks-on-aks) label as follows.
+In case you installed SPO on an [AKS cluster](https://azure.microsoft.com/en-us/products/kubernetes-service/#overview), it is recommended to [configure webhook](#configuring-webhooks) to respect the [control-plane](https://learn.microsoft.com/en-us/azure/aks/faq#can-i-use-admission-controller-webhooks-on-aks-) label as follows.
 The `namespaceSelector` replaces the default one of the webhook, so it has to keep the `spo.x-k8s.io/enable-binding` and `spo.x-k8s.io/enable-recording` requirements, otherwise the webhooks apply to every namespace.
 The patch replaces all entries of `webhook.options`, see [configuring webhooks](#configuring-webhooks) for the default entry to keep on OpenShift:
 
@@ -382,10 +377,12 @@ verbose logs, patch the spod config by adjusting the value:
 securityprofilesoperatordaemon.security-profiles-operator.x-k8s.io/spod patched
 ```
 
-The daemon should now indicate that it's using the new logging verbosity:
+The daemon should now indicate that it's using the new logging verbosity. It
+logs the line once at its start, so `--tail=-1` reads the whole log instead of
+its last lines:
 
 ```
-> kubectl -n security-profiles-operator logs --selector name=spod -c security-profiles-operator | head -n1
+> kubectl -n security-profiles-operator logs --selector name=spod -c security-profiles-operator --tail=-1 | grep "Set logging verbosity"
 "Set logging verbosity to 1"
 ```
 
@@ -451,17 +448,22 @@ kubectl -n security-profiles-operator patch spod spod --type merge -p \
 
 #### Select the selinuxd image
 
-The selinuxd container has to match the SELinux policy of the node, so the
-operator picks its image per node. The `selinuxd-image-mapping.json` key of the
-`security-profiles-operator-profile` ConfigMap maps regular expressions on the
-operating system of the node, as `kubectl get node -o
-jsonpath='{.status.nodeInfo.osImage}'` shows it, to the environment variables
-of the operator deployment which hold the images, like
-`RELATED_IMAGE_SELINUXD_EL9`. The first matching entry wins, and nodes
-without a match get the image of `RELATED_IMAGE_SELINUXD`, like the nodes whose
-variable is not set. The
+The selinuxd container has to match the SELinux policy of the nodes. The
+`selinuxd-image-mapping.json` key of the `security-profiles-operator-profile`
+ConfigMap maps regular expressions on the operating system of a node, as
+`kubectl get node -o jsonpath='{.status.nodeInfo.osImage}'` shows it, to the
+environment variables of the operator deployment which hold the images, like
+`RELATED_IMAGE_SELINUXD_EL9`. The first matching entry wins, and a node without
+a match gets the image of `RELATED_IMAGE_SELINUXD`, like a node whose variable
+is not set. The
 [command line reference](reference/security-profiles-operator.md) lists the
 variables.
+
+The operator picks a single image for all daemon pods: it matches the operating
+system of the node which the operator pod runs on, when the operator starts. The
+nodes with SELinux enabled should therefore run the operating system version of
+the node of the operator pod. Changes to the mapping take effect when the
+operator restarts.
 
 The released manifests and the Helm chart set the variables of the images
 which [selinuxd](https://github.com/containers/selinuxd) publishes. The mapping
@@ -576,14 +578,12 @@ See [Recording based on audit log](profiles.md#recording-based-on-audit-log) for
 
 ### Enable memory optimization in spod
 
-The controller running inside of spod daemon process is watching all pods available in the cluster when profile recording
-is enabled. It will perform some pre-filtering before the reconciliation to select only the pods running on local
-node as well as pods annotated for recording, but this operation takes place after all pods objects are loaded
-into the cache memory of the informer. This can lead to very high memory usage in large clusters with 1000s of pods, resulting
-in spod daemon running out of memory or crashing.
+The spod daemon caches the pods running on its node. On nodes with many pods,
+this cache can make the daemon use a lot of memory or run out of it.
 
-In order to prevent this situation, the spod daemon can be configured to only load into the cache memory the pods explicitly
-labeled for profile recording. This can be achieved by enabling memory optimization as follows:
+The daemon can be configured to cache only the pods of its node which are
+explicitly labeled for profile recording. This can be achieved by enabling
+memory optimization as follows:
 
 ```
 kubectl -n security-profiles-operator patch spod spod --type=merge -p '{"spec":{"enableMemoryOptimization":true}}'
@@ -668,7 +668,7 @@ spec:
 ```
 
 OLM would then take care of updating the operator `Deployment` object with the new environment variable.
-Please refer to the [OLM documentation](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/doc/design/subscription-config.md#res)
+Please refer to the [OLM documentation](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/doc/design/subscription-config.md#env)
 for more details on tuning the operator's configuration with the `Subscription` objects.
 
 #### OLM install modes and namespaces
@@ -679,6 +679,14 @@ With the `OwnNamespace` install mode, which only targets that namespace,
 `ProfileBinding`s therefore have no effect. Use the `SingleNamespace` or
 `MultiNamespace` install mode to target other namespaces for them.
 `ProfileRecording`s work in the namespace of the operator.
+
+The operator and its daemons only watch the target namespaces of the install
+mode, like with [a single namespace](#restricting-to-a-single-namespace). The
+profiles are cluster scoped and not affected. The webhooks are not restricted
+to the target namespaces, so only these should carry the
+`spo.x-k8s.io/enable-binding` and `spo.x-k8s.io/enable-recording` labels: a
+`ProfileBinding` or `ProfileRecording` in another namespace still changes the
+pods there, but the operator and the daemons ignore it and its pods.
 
 The bundle binds the `spo-metrics-client` cluster role to the
 `spo-metrics-client` service account of the `security-profiles-operator`
@@ -718,7 +726,8 @@ A `namespaceSelector` or `objectSelector` in `webhook.options` replaces the defa
 the webhook instead of adding to it. A `namespaceSelector` for `binding.spo.io` or `recording.spo.io`
 therefore has to repeat the `spo.x-k8s.io/enable-binding` or `spo.x-k8s.io/enable-recording`
 requirement, otherwise the webhook applies to every namespace the selector matches. Whatever the
-selector says, the operator keeps its own namespace excluded from `binding.spo.io`.
+selector says, the operator keeps its own namespace excluded from `binding.spo.io`, and the pods
+of the operator and the webhook excluded from `recording.spo.io`.
 
 `webhook.options` is a list, so a `--type=merge` patch replaces all of its entries. The OpenShift
 manifests of this repository, `deploy/openshift-dev.yaml` and `deploy/openshift-downstream.yaml`,

@@ -50,6 +50,10 @@ const (
 	linkedPodsKey    = ".metadata.bindingActiveWorkloads"
 	finalizer        = "active-workload-lock"
 	reconcileTimeout = 1 * time.Minute
+
+	// appliedBindingsKey indexes the pods by the bindings the webhook
+	// applied to them.
+	appliedBindingsKey = ".metadata.annotations.appliedBindings"
 )
 
 // NewController returns a new empty controller instance.
@@ -78,7 +82,7 @@ func (r *BindingTrackerReconciler) SchemeBuilder() runtime.SchemeBuilder {
 //nolint:lll // required for kubebuilder
 // +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,resources=profilebindings,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,resources=profilebindings/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,resources=securityprofilesoperatordaemons,verbs=get;list;watch
+// +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,namespace=security-profiles-operator,resources=securityprofilesoperatordaemons,verbs=get;list;watch
 // +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,resources=seccompprofiles;selinuxprofiles;apparmorprofiles,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
@@ -479,14 +483,8 @@ func (r *BindingTrackerReconciler) profileCarrier(
 	}
 
 	return func(pod *corev1.Pod) bool {
-		if sc := pod.Spec.SecurityContext; sc != nil &&
-			carries(sc.SeccompProfile, sc.SELinuxOptions, sc.AppArmorProfile) {
-			return true
-		}
-
-		for ctr := range util.AllContainers(pod) {
-			if sc := ctr.SecurityContext; sc != nil &&
-				carries(sc.SeccompProfile, sc.SELinuxOptions, sc.AppArmorProfile) {
+		for fields := range util.SecurityContextProfiles(pod) {
+			if carries(fields.Seccomp, fields.SELinux, fields.AppArmor) {
 				return true
 			}
 		}

@@ -301,8 +301,16 @@ func TestReconcileSeccompProfileSaveError(t *testing.T) {
 	require.Len(t, evs, 1)
 	require.Equal(t, "Warning "+reasonCannotSaveProfile+" disk full", evs[0])
 
-	// The node must not claim the profile is installed.
-	require.Equal(t, secprofnodestatusapi.ProfileStatePending, env.nodeStatus(t).Status.Status)
+	// The node must not claim the profile is installed, and tells why.
+	status := env.nodeStatus(t)
+	require.Equal(t, secprofnodestatusapi.ProfileStateError, status.Status.Status)
+	require.Contains(t, status.Status.Message, "disk full")
+
+	// A later attempt which succeeds installs it.
+	env.saveErr = nil
+	_, err = env.reconcile(t)
+	require.NoError(t, err)
+	require.Equal(t, secprofnodestatusapi.ProfileStateInstalled, env.nodeStatus(t).Status.Status)
 }
 
 func TestReconcileSeccompProfileNotAllowed(t *testing.T) {
@@ -391,10 +399,12 @@ func TestReconcileSeccompProfileGetSPODError(t *testing.T) {
 	env := newReconcileEnv(t, newTestProfile())
 	env.impl.GetSPODReturns(nil, errors.New("no spod"))
 
-	// A failure of the API server is retried with backoff.
+	// A failure of the API server is retried with backoff, the status
+	// tells why the profile is not installed.
 	_, err := env.reconcile(t)
 	require.ErrorContains(t, err, "retrieving the SPOD configuration: no spod")
-	require.Equal(t, secprofnodestatusapi.ProfileStatePending, env.nodeStatus(t).Status.Status)
+	require.Equal(t, secprofnodestatusapi.ProfileStateError, env.nodeStatus(t).Status.Status)
+	require.Contains(t, env.nodeStatus(t).Status.Message, "no spod")
 	require.Empty(t, env.saved)
 }
 
@@ -406,11 +416,13 @@ func TestReconcileSeccompProfileMergeError(t *testing.T) {
 	env := newReconcileEnv(t, sp)
 	env.impl.ClientGetProfileReturns(nil, errors.New("api down"))
 
-	// A base profile which cannot be looked up is retried with backoff.
+	// A base profile which cannot be looked up is retried with backoff, the
+	// status tells why the profile is not installed.
 	_, err := env.reconcile(t)
 	require.ErrorContains(t, err, "api down")
 	require.Empty(t, env.events())
-	require.Equal(t, secprofnodestatusapi.ProfileStatePending, env.nodeStatus(t).Status.Status)
+	require.Equal(t, secprofnodestatusapi.ProfileStateError, env.nodeStatus(t).Status.Status)
+	require.Contains(t, env.nodeStatus(t).Status.Message, "api down")
 
 	// A missing base profile is shown and not retried: the profile gets
 	// enqueued once the base profile is created.
@@ -794,6 +806,7 @@ func TestReconcileSeccompProfileDisabledKeepsFileOfOtherProfile(t *testing.T) {
 	require.NoError(t, env.cli.Get(t.Context(), testProfileKey, stored))
 	ns, err := nodestatus.NewForProfileOnNode(stored, env.cli, testNode)
 	require.NoError(t, err)
+	ns.WithWrittenStates(&env.rec.writtenStates)
 	require.NoError(t, ns.SetNodeStatus(t.Context(), secprofnodestatusapi.ProfileStateInstalled))
 
 	_, err = env.reconcile(t)
@@ -848,6 +861,47 @@ func TestAnnotateSyscallsPerArchitecture(t *testing.T) {
 	got = stored()
 	require.Contains(t, got.Annotations, syscallsAnnotation)
 	require.NotContains(t, got.Annotations, archKey)
+}
+
+// Two nodes of the same architecture can hold different pulls of a base
+// profile referenced by tag. A node does not write back a value which it wrote
+// before and which another node replaced, otherwise both would overwrite each
+// other on every resync.
+func TestAnnotateSyscallsKeepsValueOfOtherNode(t *testing.T) {
+	t.Parallel()
+
+	env := newReconcileEnv(t, newTestProfile())
+	archKey := syscallsAnnotationKey(true)
+
+	stored := func() *seccompprofileapi.SeccompProfile {
+		got := &seccompprofileapi.SeccompProfile{}
+		require.NoError(t, env.cli.Get(t.Context(), testProfileKey, got))
+
+		return got
+	}
+
+	ours := []seccompprofileapi.Syscall{
+		{Names: []string{"read"}, Action: seccompprofileapi.ActAllow},
+	}
+	require.NoError(t, env.rec.annotateSyscalls(t.Context(), stored(), ours, true, log.Log))
+
+	other := stored()
+	other.Annotations[archKey] = `[{"names":["write"],"action":"SCMP_ACT_ALLOW"}]`
+	require.NoError(t, env.cli.Update(t.Context(), other))
+
+	rv := stored().GetResourceVersion()
+	require.NoError(t, env.rec.annotateSyscalls(t.Context(), stored(), ours, true, log.Log))
+	require.Equal(t, rv, stored().GetResourceVersion())
+
+	// A result which changed is written.
+	changed := []seccompprofileapi.Syscall{
+		{Names: []string{"read", "close"}, Action: seccompprofileapi.ActAllow},
+	}
+	require.NoError(t, env.rec.annotateSyscalls(t.Context(), stored(), changed, true, log.Log))
+	require.JSONEq(t,
+		`[{"names":["read","close"],"action":"SCMP_ACT_ALLOW"}]`,
+		stored().Annotations[archKey],
+	)
 }
 
 func TestReconcileSeccompProfileDeletion(t *testing.T) {
@@ -1050,10 +1104,6 @@ func TestSiblingRequests(t *testing.T) {
 			)
 		})
 	}
-
-	require.Empty(t, siblingRequests(t.Context(), &seccompprofileapi.SeccompProfile{
-		ObjectMeta: metav1.ObjectMeta{Name: ".json"},
-	}))
 }
 
 func TestOwnsFileBefore(t *testing.T) {

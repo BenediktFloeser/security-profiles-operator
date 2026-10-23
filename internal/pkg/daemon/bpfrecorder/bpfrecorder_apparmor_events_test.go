@@ -236,6 +236,31 @@ func TestHandleCapabilityEvent(t *testing.T) {
 	})
 }
 
+// TestEventsAfterStop asserts that the events which are still queued when the
+// recording stops are not recorded into the next one.
+func TestEventsAfterStop(t *testing.T) {
+	t.Parallel()
+
+	sut := newTestAppArmorRecorder()
+	sut.loaded = true
+
+	require.NoError(t, sut.StopRecording(&BpfRecorder{}))
+
+	sut.handleFileEvent(fileEvent(testKey, flagRead, "/stale"))
+	sut.handleSocketEvent(&bpfEvent{Key: testKey, Flags: socketFlags(afInet, sockStream)})
+	sut.handleCapabilityEvent(&bpfEvent{Key: testKey, Flags: 1})
+
+	require.Empty(t, sut.recordedFiles)
+	require.Empty(t, sut.recordedSocketsUse)
+	require.Empty(t, sut.recordedCapabilities)
+	require.Empty(t, sut.trackedKeys)
+
+	require.NoError(t, sut.StartRecording(&BpfRecorder{}))
+
+	sut.handleFileEvent(fileEvent(testKey, flagRead, "/fresh"))
+	require.Contains(t, sut.recordedFiles[recordingKey(testKey)], "/fresh")
+}
+
 // clearKey exists so that permissions needed only during container setup do
 // not leak into the recorded profile.
 func TestClearKey(t *testing.T) {
@@ -738,4 +763,27 @@ func TestProcessedFileRules(t *testing.T) {
 
 		require.Empty(t, got.FileProcessed.AllowedLibraries)
 	})
+}
+
+// TestStatOnlyPathsDoNotTruncate asserts that the paths which only got
+// stat'ed take up none of the tracked paths, and that a stat still counts for
+// a later write of the path.
+func TestStatOnlyPathsDoNotTruncate(t *testing.T) {
+	t.Parallel()
+
+	sut := newTestAppArmorRecorder()
+
+	for i := range maxTrackedPaths + 10 {
+		sut.handleFileEvent(fileEvent(7, flagStat, fmt.Sprintf("/data/stat/%d", i)))
+	}
+
+	require.Empty(t, sut.recordedFiles[7])
+
+	sut.handleFileEvent(fileEvent(7, flagWrite, "/data/written"))
+	sut.handleFileEvent(fileEvent(7, flagWrite, "/data/stat/1"))
+
+	processed, found := sut.processExecFsEvents([]uint64{7})
+	require.True(t, found)
+	require.Equal(t, []string{"/data/written"}, processed.WriteOnlyPaths)
+	require.Equal(t, []string{"/data/stat/1"}, processed.ReadWritePaths)
 }

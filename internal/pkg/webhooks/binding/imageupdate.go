@@ -126,7 +126,8 @@ func (v *imageUpdateValidator) Handle(
 
 	// The pod selector of a binding is ignored, because the labels of a
 	// running pod can change, so they do not tell whether the binding applied
-	// on creation.
+	// on creation. Any applying binding denies the change, the order only
+	// makes the denial name the same binding on every attempt.
 	for _, pb := range sortBindings(bindings.Items) {
 		for _, change := range changes {
 			if !bindsImage(pb, change.oldImage) && !bindsImage(pb, change.newImage) {
@@ -191,9 +192,9 @@ func (p *podBinder) bindingApplies(
 		return true, nil
 	case kerrors.IsNotFound(err):
 		return false, nil
-	case errors.Is(err, errProfPartial):
+	case errors.Is(err, errProfPartial), errors.Is(err, errProfDeleted):
 		// The mutating webhook rejects new pods, but the running pods may
-		// have been bound by an earlier release.
+		// have been bound by an earlier release, or before the deletion.
 		return true, nil
 	case errors.Is(err, errProfWithoutStatus):
 		return p.cachedProfileKindEnabled(ctx, lookup, profileKind)

@@ -88,7 +88,8 @@ The running permissions for the three core technologies supported:
 The operator and webhook deployments run as non-root with a read-only root filesystem, all
 capabilities dropped, privilege escalation disabled and the `RuntimeDefault` seccomp profile.
 On OpenShift they are pinned to the `restricted-v2` SCC through the
-`openshift.io/required-scc` annotation. Only the `spod` DaemonSet uses the `privileged` SCC.
+`openshift.io/required-scc` annotation. Only the pods of the `spod` service account (the `spod`
+DaemonSet and the SELinux policy reload Job) use the `privileged` SCC.
 
 
 #### Host Paths
@@ -121,8 +122,11 @@ its token into pods. The `spo-metrics-client-token` Secret holds a long lived to
 ServiceAccount for the `ServiceMonitor` of the operator. Pods running with the `default`
 ServiceAccount of the operator namespace have no access to the metrics. The OpenShift downstream
 manifests bind the ClusterRole to the `prometheus-k8s` ServiceAccount of the
-`openshift-monitoring` namespace as well, and let it discover the endpoints through a Role which
-only allows reading the pods, services, endpoints and endpoint slices of the operator namespace.
+`openshift-monitoring` namespace as well. The `kubectl` manifests and the OLM bundle, but not the
+Helm chart, let that ServiceAccount discover the endpoints through the `spo-prometheus-k8s` Role,
+which only allows reading the pods, services, endpoints and endpoint slices of the operator
+namespace. On clusters without the `openshift-monitoring` namespace, the RoleBinding of the Role
+grants nothing.
 
 ### Profile Generation Mode (auto-generating security profiles)
 
@@ -206,12 +210,12 @@ API groups of its role.
   read and patch only for `spo-mutating-webhook-configuration` and
   `spo-validating-webhook-configuration`.
 - ValidatingAdmissionPolicies and their bindings (`admissionregistration.k8s.io`): create, and
-  read and update only for `spo-recording-profiles`.
-- Operator namespace only: daemonsets and deployments (`apps`), the PodDisruptionBudget of the
-  webhook (`policy`), services, servicemonitors (`monitoring.coreos.com`, create and patch
-  only), cert-manager issuers and certificates (`cert-manager.io`), the
-  `security-profiles-operator-profile` ConfigMap (read), leases (`coordination.k8s.io`), and
-  the `restricted-v2` SCC (`security.openshift.io`). Only the webhook deployment gets updated,
+  read and update only for `spo-recording-profiles` and the four `spo-spod-*` policies below.
+- Operator namespace only: the `spod` resource, daemonsets and deployments (`apps`), the
+  PodDisruptionBudget of the webhook (`policy`), services, servicemonitors
+  (`monitoring.coreos.com`, create and patch only), cert-manager issuers and certificates
+  (`cert-manager.io`), the `security-profiles-operator-profile` ConfigMap (read), leases
+  (`coordination.k8s.io`), and the `restricted-v2` SCC (`security.openshift.io`). Only the webhook deployment gets updated,
   the other operands are created and merge patched.
 - Own API: delete on seccomp profiles, to remove the ones which the allow lists of the `spod`
   resource reject once for the cluster, see
@@ -231,9 +235,9 @@ API groups of its role.
   (`authentication.k8s.io`) and subjectaccessreviews (`authorization.k8s.io`) for the metrics,
   OpenShift apiservers and clusteroperators (`config.openshift.io`, read), for the TLS profile
   of the metrics endpoint.
-- Operator namespace only: jobs (`batch`) to reload SELinux policies, get on secrets and
-  configmaps for the public keys and the Sigstore trusted roots of the
-  [signature verification](#oci-artifact-signature-verification) of OCI base profiles, and the
+- Operator namespace only: the `spod` resource (read), jobs (`batch`) to reload SELinux
+  policies, get on secrets and configmaps for the public keys and the Sigstore trusted roots of
+  the [signature verification](#oci-artifact-signature-verification) of OCI base profiles, and the
   `privileged` SCC (`security.openshift.io`). The `spod` resource names these secrets and
   configmaps, so the role cannot be limited to them and allows reading all secrets and
   configmaps of the operator namespace, like the `spo-metrics-client-token` Secret and the
@@ -258,7 +262,10 @@ ValidatingAdmissionPolicies limit the writes of the `spod` service account:
   change. Finalizers and annotations are not restricted. A compromised node can therefore
   still change recorded profiles, which are cluster scoped. Removing the
   `spo.x-k8s.io/recording-id` label from a recorded profile once its recording is done keeps
-  the daemons from changing it.
+  the daemons from changing it. The policy does not check that the labels name an existing
+  recording, so a compromised node can also create a profile under any name which is not
+  taken yet, for example one which a profile binding or a pod refers to before the profile
+  exists. The daemons of all nodes install it, and the pods using it run with it.
 - `spo-spod-jobs`: jobs have to be the SELinux policy reload job, running as `spod` on the
   node of the requesting daemon. The node is taken from the node name which Kubernetes adds to
   projected service account tokens, by default since 1.30 through the
@@ -280,9 +287,17 @@ ValidatingAdmissionPolicies limit the writes of the `spod` service account:
   denying them would keep the daemons from installing profiles, so the writes are not
   restricted then.
 
-The operator namespace is not known to the policies, so they apply to the service accounts
-named `spod` of all namespaces. The OLM bundle cannot ship ValidatingAdmissionPolicies, so
-installations through OLM come without these policies.
+The operator namespace is not known to the policies of the manifests, so they apply to the
+service accounts named `spod` of all namespaces. The OLM bundle cannot ship
+ValidatingAdmissionPolicies, so the operator creates the policies and their bindings if they are
+missing, which only apply to the `spod` service account of the operator namespace, and updates the
+ones it created when a new release changes them. It marks the ones it created with the
+`spo.x-k8s.io/admission-policy-hash` annotation and leaves the policies and bindings without it
+alone, like the ones of the kustomize and Helm manifests. To customize a policy, replace it with
+an own copy without that annotation. A deleted policy or binding is created again, so a policy
+cannot be turned off by deleting it, only by replacing it, for example with a binding whose
+`validationActions` are `["Audit"]`. The operator does not watch these policies, it checks them
+again every ten minutes. Like the `spo-recording-profiles` policy, they stay when the operator gets uninstalled.
 
 ### spo-webhook
 
@@ -312,7 +327,8 @@ namespace, and also binds ephemeral containers, which get added to running pods 
 is not installed yet, so pods bound to it are rejected, unless its kind is disabled
 in the `spod` resource, in which case the binding is skipped with an event. Pods bound to a
 partial profile of a recording are rejected as well, because the daemons never install partial
-profiles. The bindings only
+profiles, like pods bound to a profile which is being deleted and which no pod uses, because the
+daemons remove it from the nodes. The bindings only
 apply on pod creation, so the `binding-image.spo.io` validating webhook, which selects the same
 namespaces and pods, rejects image changes of running pods while an image binding matches the
 old or the new image. A match condition limits it to the updates which change an image. The
@@ -343,8 +359,8 @@ For the most up-to-date rbac requirements refer to the materialised [role.yaml](
 
 Base profiles can be distributed as OCI artifacts and are signature verified on
 pull. Sigstore bundles attached through the OCI referrers API are verified if
-present, otherwise legacy cosign signature tags. Verification is controlled
-through the `spod` resource:
+present, and legacy cosign signature tags if none of the bundles is valid or
+there are none. Verification is controlled through the `spod` resource:
 
 ```yaml
 spec:

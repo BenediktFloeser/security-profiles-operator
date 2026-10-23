@@ -235,6 +235,12 @@ func (e *e2e) testCases() []testCase {
 			clusterWideOnly: true,
 		},
 		{
+			description:     "Selinux: Verify that the SPOD can deny permissive policies",
+			fn:              e.testCaseSelinuxDeniedPermissivePolicy,
+			clusterWideOnly: true,
+			flaky:           true,
+		},
+		{
 			description:     "Selinux: Verify the policy can be marked as permissive: disabled",
 			fn:              func([]string) { e.testCaseSelinuxIncompleteDisabledPolicy() },
 			clusterWideOnly: true,
@@ -282,14 +288,10 @@ func (e *e2e) testCases() []testCase {
 		{
 			description: "Seccomp: Metrics",
 			fn:          e.testCaseSeccompMetrics,
-			flaky:       true,
-			issue:       nodeAwareMetricsIssue,
 		},
 		{
 			description: "SPOD: Test webhook HTTP version",
 			fn:          e.testCaseWebhookHTTP,
-			flaky:       true,
-			issue:       podOutputIssue,
 		},
 		{
 			description: "SPOD: Test Metrics HTTP version",
@@ -331,15 +333,11 @@ func (e *e2e) testCases() []testCase {
 		{
 			description:     "Seccomp: Verify profile recording logs: deployment",
 			fn:              func([]string) { e.testCaseProfileRecordingDeploymentLogs() },
-			flaky:           true,
-			issue:           untrackedIssue,
 			clusterWideOnly: true,
 		},
 		{
 			description:     "Seccomp: Verify profile recording logs: finalizers",
 			fn:              func([]string) { e.testCaseRecordingFinalizers() },
-			flaky:           true,
-			issue:           untrackedIssue,
 			clusterWideOnly: true,
 		},
 		{
@@ -409,12 +407,6 @@ const (
 	// bindingIssue is why the binding test cases do not run for the
 	// namespaced operator.
 	bindingIssue = "the webhook certificates of the namespaced operator are not ready in time"
-	// podOutputIssue marks the test cases whose pod command returned no
-	// output in the namespaced run on Prow, while kubectl run -i lost the
-	// output printed before it attached. The output gets read from the pod
-	// logs now.
-	podOutputIssue = "the pod command returned no output in the namespaced run on Prow, " +
-		"promote it once it passes reliably with the output read from the pod logs"
 	// inUseFinalizerIssue marks the test cases which wait for the in-use
 	// finalizer of a profile, which a conflicting update of the workload
 	// annotator can lose.

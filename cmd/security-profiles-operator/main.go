@@ -134,6 +134,8 @@ const (
 	enricherLogSourceParam   string = "enricher-log-source"
 	// Deprecated: TLS version is now managed via OpenShift TLS profiles.
 	tlsMinVersionParam string = "tls-min-version"
+	// Deprecated: the operator manages the resources of the webhook.
+	staticWebhookParam string = "static"
 
 	// defaultTrue is the default text of the boolean flags which default to
 	// true.
@@ -405,7 +407,7 @@ func webhookCommand(info *version.Info) *cli.Command {
 				Usage:   "the port on which to expose the webhook service",
 			},
 			&cli.BoolFlag{
-				Name:    "static",
+				Name:    staticWebhookParam,
 				Aliases: []string{"s"},
 				Hidden:  true,
 				Usage:   "deprecated and ignored, the operator manages the resources of the webhook",
@@ -715,6 +717,7 @@ func runManager(ctx *cli.Context, info *version.Info) error {
 		schemeAPI{"seccompprofile v1", seccompprofilev1.AddToScheme},
 		schemeAPI{"apparmorprofile v1", apparmorprofilev1.AddToScheme},
 		schemeAPI{"selinuxprofile v1", selinuxprofilev1.AddToScheme},
+		schemeAPI{"SPOD config v1", spodv1.AddToScheme},
 		schemeAPI{"ServiceMonitor", monitoringv1.AddToScheme},
 	); err != nil {
 		return err
@@ -757,8 +760,17 @@ func runManager(ctx *cli.Context, info *version.Info) error {
 
 	setupLog.Info("enabled controllers", "controllers", enabledControllers)
 
+	// The platform got detected for the TLS configuration already.
+	caInjectType := bindata.CAInjectTypeCertManager
+	if tlsCfg.isOpenShift {
+		caInjectType = bindata.CAInjectTypeOpenShift
+	}
+
 	setupCtx := controller.WithMaxConcurrentReconciles(
-		context.WithValue(ctx.Context, spod.ManageWebhookKey, manageWebhook(ctx)),
+		bindata.WithCAInjectType(
+			context.WithValue(ctx.Context, spod.ManageWebhookKey, manageWebhook(ctx)),
+			caInjectType,
+		),
 		ctx.Int(maxConcurrentReconcilesFlag),
 	)
 
@@ -884,7 +896,8 @@ func setRESTMapper(opts *ctrl.Options, cfg *rest.Config) (servedAPIs, error) {
 // restrictOperandCache limits the cache of the operand kinds to the operator
 // namespace. The operator creates them only there and its RBAC permissions are
 // scoped to that namespace, so a cluster wide informer would not be allowed to
-// list them. The cluster scoped operands are cached by name for the same
+// list them. The same holds for the SPOD, which is only read in the operator
+// namespace. The cluster scoped operands are cached by name for the same
 // reason, and the pods, which every namespace can hold, are stripped down to
 // the fields the controllers read. The admission policies and the cert-manager
 // resources are only added if the cluster serves their API, because creating
@@ -904,6 +917,7 @@ func restrictOperandCache(
 		&appsv1.Deployment{},
 		&corev1.Service{},
 		&policyv1.PodDisruptionBudget{},
+		&spodv1.SecurityProfilesOperatorDaemon{},
 	}
 
 	if served.certManager {
@@ -1058,9 +1072,12 @@ func getEnabledControllers(ctx *cli.Context) []controller.Controller {
 // The same goes for the node statuses: the daemon only reads and writes the
 // ones of its own node, while the cluster holds one per node and profile.
 //
+// The SPOD is only read in the operator namespace, which the RBAC permissions
+// of the daemon are scoped to.
+//
 // When memory optimization is additionally enabled, only pods labeled for
 // recording are cached on top of that.
-func newDaemonCache(ctx *cli.Context) cache.NewCacheFunc {
+func newDaemonCache(ctx *cli.Context, operatorNamespace string) cache.NewCacheFunc {
 	nodeName := os.Getenv(config.NodeNameEnvKey)
 	if nodeName == "" {
 		setupLog.Info(
@@ -1072,7 +1089,7 @@ func newDaemonCache(ctx *cli.Context) cache.NewCacheFunc {
 	memOptim := ctx.Bool(memOptimFlag)
 
 	return func(restConfig *rest.Config, opts cache.Options) (cache.Cache, error) {
-		setDaemonCacheOptions(&opts, nodeName, memOptim)
+		setDaemonCacheOptions(&opts, nodeName, operatorNamespace, memOptim)
 
 		return cache.New(restConfig, opts)
 	}
@@ -1082,11 +1099,18 @@ func newDaemonCache(ctx *cli.Context) cache.NewCacheFunc {
 // the pod cache to the pods of the node and, with memory optimization, to the
 // pods labeled for recording. The node status cache is restricted to the
 // statuses of the node by their node label, which every status carries since
-// the per-node statuses got introduced. Like in the manager and the webhook,
-// the managed fields, which no daemon controller reads, are not cached.
-func setDaemonCacheOptions(opts *cache.Options, nodeName string, memOptim bool) {
+// the per-node statuses got introduced. The SPOD cache is restricted to the
+// operator namespace. Like in the manager and the webhook, the managed fields,
+// which no daemon controller reads, are not cached.
+func setDaemonCacheOptions(
+	opts *cache.Options, nodeName, operatorNamespace string, memOptim bool,
+) {
 	byPod := cache.ByObject{}
-	byObject := map[client.Object]cache.ByObject{}
+	byObject := map[client.Object]cache.ByObject{
+		&spodv1.SecurityProfilesOperatorDaemon{}: {
+			Namespaces: map[string]cache.Config{operatorNamespace: {}},
+		},
+	}
 
 	if nodeName != "" {
 		byPod.Field = fields.OneTermEqualSelector("spec.nodeName", nodeName)
@@ -1401,17 +1425,14 @@ func runDaemon(ctx *cli.Context, info *version.Info) error {
 		return errors.New("no controllers enabled")
 	}
 
-	cfg, tlsCfg, err := clusterConfig(ctx.Context)
-	if err != nil {
-		return err
-	}
-
 	maxSeries := ctx.Int(maxMetricSeriesFlag)
 	if maxSeries < 0 {
 		return fmt.Errorf("%s must not be negative: %d", maxMetricSeriesFlag, maxSeries)
 	}
 
-	// Setup metrics
+	// Setup metrics. The recorders and enrichers connect to the gRPC server
+	// with a short backoff, so it is served before the API server gets asked
+	// for the cluster configuration, which can take a while.
 	met := metrics.New()
 	met.SetMaxSeries(maxSeries)
 
@@ -1424,6 +1445,11 @@ func runDaemon(ctx *cli.Context, info *version.Info) error {
 	}
 	defer met.GracefulStop()
 
+	cfg, tlsCfg, err := clusterConfig(ctx.Context)
+	if err != nil {
+		return err
+	}
+
 	operatorNamespace, err := config.TryToGetOperatorNamespace()
 	if err != nil {
 		return fmt.Errorf("get operator namespace: %w", err)
@@ -1432,7 +1458,7 @@ func runDaemon(ctx *cli.Context, info *version.Info) error {
 	// The sync period of the cache is set by newDaemonCache.
 	ctrlOpts := ctrl.Options{
 		HealthProbeBindAddress: fmt.Sprintf(":%d", config.HealthProbePort),
-		NewCache:               newDaemonCache(ctx),
+		NewCache:               newDaemonCache(ctx, operatorNamespace),
 		Metrics: metricsserver.Options{
 			BindAddress:    fmt.Sprintf(":%d", bindata.ContainerPort),
 			CertDir:        bindata.MetricsCertPath,
@@ -1636,11 +1662,18 @@ func nonRootEnablerKubeletDir(
 func runWebhook(ctx *cli.Context, info *version.Info) error {
 	printInfo("security-profiles-operator-webhook", info)
 
-	// Warn if deprecated tls-min-version flag is used
+	// Warn if deprecated flags are used
 	if ctx.IsSet(tlsMinVersionParam) {
 		setupLog.Info(
 			"--tls-min-version flag is deprecated and ignored, " +
 				"TLS configuration is now managed via OpenShift TLS profiles",
+		)
+	}
+
+	if ctx.IsSet(staticWebhookParam) {
+		setupLog.Info(
+			"--static flag is deprecated and ignored, " +
+				"the operator manages the resources of the webhook",
 		)
 	}
 
@@ -1948,7 +1981,9 @@ var forwardedSpocSignals = []os.Signal{
 // them itself, for example by writing the recorded profile, and must not be
 // left behind. A signal which reaches both processes, like the SIGINT of a
 // terminal or a SIGTERM sent to the process group, reaches spoc twice in a
-// short time, which spoc takes as a single one.
+// short time, which spoc takes as a single one: it forwards it to the command
+// it runs once, see cli.DuplicateSignalWindow. That command is in the process
+// group as well and gets such a signal directly too.
 func runForwardingSignals(c *exec.Cmd, stderr io.Writer) error {
 	// Subscribe before the start, a signal in between would otherwise
 	// terminate this process and leave spoc running.
@@ -1968,19 +2003,29 @@ func runForwardingSignals(c *exec.Cmd, stderr io.Writer) error {
 		close(done)
 	}()
 
-	go forwardSignals(signals, c.Process, stderr, done)
+	go forwardSignals(signals, c.Process, stderr, done, command.InTerminalForeground)
 
 	return c.Wait()
 }
 
 // forwardSignals forwards the signals to the process until done gets closed,
-// and reports the failures to stderr.
+// and reports the failures to stderr. The SIGINT of Ctrl+C reaches spoc
+// directly while it runs in the foreground of the terminal, which
+// inForeground tells, so it is not forwarded then.
 func forwardSignals(
-	signals <-chan os.Signal, process *os.Process, stderr io.Writer, done <-chan struct{},
+	signals <-chan os.Signal,
+	process *os.Process,
+	stderr io.Writer,
+	done <-chan struct{},
+	inForeground func(pid int) bool,
 ) {
 	for {
 		select {
 		case sig := <-signals:
+			if sig == os.Interrupt && inForeground(process.Pid) {
+				continue
+			}
+
 			if err := process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				fmt.Fprintf(stderr, "Unable to forward %s to %s: %v\n", sig, spocCmd, err)
 			}

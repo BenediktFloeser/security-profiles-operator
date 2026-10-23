@@ -29,9 +29,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	bpf "github.com/aquasecurity/libbpfgo"
 	v1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/podindex"
 )
 
 // runMaintenance periodically drops what nobody is going to collect while a
@@ -50,9 +52,50 @@ func (b *BpfRecorder) runMaintenance(ctx context.Context) {
 			}
 
 			b.sweepStaleKeys()
+			b.forgetGoneContainers()
 			b.releaseAbandonedRecording()
 		}
 	}
+}
+
+// forgetGoneContainers forgets the collected profiles and the containers
+// warned about which are not on the node any more. Both are only cleared when
+// the recording stops otherwise, which may never happen on a node which always
+// records something.
+func (b *BpfRecorder) forgetGoneContainers() {
+	if b.pods == nil || !b.pods.HasSynced() {
+		return
+	}
+
+	onNode := map[string]struct{}{}
+
+	for _, pod := range b.pods.Pods() {
+		for _, id := range podindex.ContainerIDs(pod) {
+			onNode[id] = struct{}{}
+		}
+	}
+
+	present := func(id string) bool {
+		_, ok := onNode[id]
+
+		return ok
+	}
+
+	b.collectedProfiles.Range(func(profile, value any) bool {
+		if containerIDs, ok := value.([]string); ok && !slices.ContainsFunc(containerIDs, present) {
+			b.collectedProfiles.Delete(profile)
+		}
+
+		return true
+	})
+
+	b.keyLimitWarned.Range(func(containerID, _ any) bool {
+		if id, ok := containerID.(string); ok && !present(id) {
+			b.keyLimitWarned.Delete(containerID)
+		}
+
+		return true
+	})
 }
 
 // sweepStaleKeys drops the data recorded under keys which no recorded container
@@ -106,7 +149,7 @@ func (b *BpfRecorder) sweepStaleKeys() {
 
 	b.staleKeys = stale
 
-	b.pruneExcludedKeys(generation)
+	b.pruneRemovedCgroups(generation)
 
 	if len(drop) == 0 {
 		return
@@ -143,30 +186,62 @@ func (b *BpfRecorder) sweepStaleKeys() {
 	}
 }
 
-// pruneExcludedKeys forgets the excluded workloads whose cgroup is gone.
-// Cgroup IDs are never reused, but every excluded one stays in the kernel map
-// otherwise, which fills up during a long recording. With other keys, an
-// excluded workload is only known to be gone once the session ends.
-func (b *BpfRecorder) pruneExcludedKeys(generation uint64) {
+// pruneRemovedCgroups forgets the excluded workloads and the started
+// containers whose cgroup is gone. Cgroup IDs are never reused, but every one
+// of them stays in the kernel maps otherwise, which fill up during a long
+// recording. The maps of the started containers evict their oldest entries
+// then, which is the one of a long running container, so that the next exec
+// into it would clear what got recorded for it. With other keys, a workload
+// is only known to be gone once the session ends.
+func (b *BpfRecorder) pruneRemovedCgroups(generation uint64) {
 	if !b.cgroupKeys {
 		return
 	}
 
+	// A cgroup is in several of the maps, its removal is checked once.
+	removed := map[uint64]bool{}
+
+	b.pruneCgroupKeys(generation, removed, "excluded workloads",
+		func() *bpf.BPFMap { return b.excludeKeysBpfMap },
+		func(key uint64) {
+			if b.AppArmor != nil {
+				b.AppArmor.Unexclude(key)
+			}
+		},
+	)
+	b.pruneCgroupKeys(generation, removed, "started seccomp workloads",
+		func() *bpf.BPFMap { return b.seccompInitBpfMap }, nil,
+	)
+	b.pruneCgroupKeys(generation, removed, "started AppArmor workloads",
+		func() *bpf.BPFMap { return b.apparmorInitBpfMap }, nil,
+	)
+}
+
+// pruneCgroupKeys deletes the keys whose cgroup got removed from the map
+// which bpfMap returns, and calls forget for each, unless it is nil. removed
+// caches the removals checked already.
+func (b *BpfRecorder) pruneCgroupKeys(
+	generation uint64,
+	removed map[uint64]bool,
+	what string,
+	bpfMap func() *bpf.BPFMap,
+	forget func(key uint64),
+) {
 	// Close frees the map under the write lock, so it is listed under the
 	// read lock.
 	b.attachUnattachMutex.RLock()
 
-	if b.excludeKeysBpfMap == nil {
+	if bpfMap() == nil {
 		b.attachUnattachMutex.RUnlock()
 
 		return
 	}
 
-	raw, err := b.MapKeys(b.excludeKeysBpfMap)
+	raw, err := b.MapKeys(bpfMap())
 	b.attachUnattachMutex.RUnlock()
 
 	if err != nil {
-		b.logger.Error(err, "Unable to list excluded workloads")
+		b.logger.Error(err, "Unable to list "+what)
 
 		return
 	}
@@ -178,20 +253,24 @@ func (b *BpfRecorder) pruneExcludedKeys(generation uint64) {
 			continue
 		}
 
-		// Only a removed cgroup is gone. Other errors, like a cgroup outside
-		// of the cgroup namespace of the daemon, tell nothing about it.
 		key := binary.NativeEndian.Uint64(k)
 
-		removed, err := b.CgroupRemoved(key)
-		if err != nil {
-			b.logger.V(config.VerboseLevel).Info(
-				"Unable to check the cgroup of an excluded workload", "key", key, "error", err.Error(),
-			)
+		isRemoved, checked := removed[key]
+		if !checked {
+			// Only a removed cgroup is gone. Other errors, like a cgroup
+			// outside of the cgroup namespace of the daemon, tell nothing
+			// about it.
+			isRemoved, err = b.CgroupRemoved(key)
+			if err != nil {
+				b.logger.V(config.VerboseLevel).Info(
+					"Unable to check the cgroup of a workload", "key", key, "error", err.Error(),
+				)
+			}
 
-			continue
+			removed[key] = isRemoved
 		}
 
-		if removed {
+		if isRemoved {
 			gone = append(gone, key)
 		}
 	}
@@ -203,19 +282,19 @@ func (b *BpfRecorder) pruneExcludedKeys(generation uint64) {
 	b.attachUnattachMutex.RLock()
 	defer b.attachUnattachMutex.RUnlock()
 
-	if b.recordingGeneration.Load() != generation || b.excludeKeysBpfMap == nil {
+	if b.recordingGeneration.Load() != generation || bpfMap() == nil {
 		return
 	}
 
 	for _, key := range gone {
-		if err := b.DeleteKey64(b.excludeKeysBpfMap, key); err != nil {
-			b.logger.Error(err, "Unable to forget excluded workload", "key", key)
+		if err := b.DeleteKey64(bpfMap(), key); err != nil {
+			b.logger.Error(err, "Unable to forget workload", "key", key, "map", what)
 
 			continue
 		}
 
-		if b.AppArmor != nil {
-			b.AppArmor.Unexclude(key)
+		if forget != nil {
+			forget(key)
 		}
 	}
 }
@@ -328,7 +407,15 @@ func (b *BpfRecorder) releaseAbandonedRecording() {
 		return
 	}
 
-	recorded := slices.ContainsFunc(b.pods.Pods(), recordsBpf)
+	recorded := slices.ContainsFunc(b.pods.Pods(), func(pod *v1.Pod) bool {
+		if !recordsBpf(pod) {
+			return false
+		}
+
+		recorded, _ := b.recordsPod(pod)
+
+		return recorded
+	})
 
 	b.startMu.Lock()
 	defer b.startMu.Unlock()
@@ -378,6 +465,7 @@ func (b *BpfRecorder) releaseAbandonedRecording() {
 	// A later Stop of these clients finds nothing to stop, so it cannot end
 	// the recording of a client which starts one afterwards.
 	clear(b.sessions)
+	clear(b.sessionProfiles)
 	b.anonymousStarts = 0
 	b.updateStartRequests()
 }
@@ -389,6 +477,12 @@ func recordsBpf(pod *v1.Pod) bool {
 		return false
 	}
 
+	return hasBpfRecordingAnnotation(pod)
+}
+
+// hasBpfRecordingAnnotation reports whether a pod carries an annotation which
+// names the profile the BPF recorder records a container for.
+func hasBpfRecordingAnnotation(pod *v1.Pod) bool {
 	for key, value := range pod.Annotations {
 		if value == "" {
 			continue

@@ -23,7 +23,6 @@ import (
 	"maps"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -621,13 +620,14 @@ func (r *RecorderReconciler) Reconcile(
 		}
 
 		if len(profiles) == 0 {
-			logger.Info("No profile recording requests the annotations on this pod")
+			logger.V(config.VerboseLevel).
+				Info("No profile recording requests the annotations on this pod")
 
 			return reconcile.Result{}, nil
 		}
 
 		if recorder == profilerecordingapi.ProfileRecorderBpf {
-			if err := r.startBpfRecorder(ctx, bpf, pod.UID); err != nil {
+			if err := r.startBpfRecorder(ctx, bpf, pod, profiles); err != nil {
 				// A disabled recorder does not get enabled by a retry, the
 				// SPOD change restarts the daemon anyway.
 				if unrecordable(err) {
@@ -861,23 +861,19 @@ func (r *RecorderReconciler) collectPod(
 func (r *RecorderReconciler) getBpfRecorderClient(
 	ctx context.Context,
 ) (bpfrecorderapi.BpfRecorderClient, *grpc.ClientConn, error) {
-	r.log.Info("Checking if bpf recorder is enabled")
+	r.log.V(config.VerboseLevel).Info("Checking if bpf recorder is enabled")
 
 	spod, err := r.getSPOD(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("getting SPOD config: %w", err)
 	}
 
-	enableBpfRecorderEnv, err := strconv.ParseBool(os.Getenv(config.EnableBpfRecorderEnvKey))
-	if err != nil {
-		enableBpfRecorderEnv = false
-	}
-
-	if !ptr.Deref(spod.Spec.Enricher.EnableBpfRecorder, false) && !enableBpfRecorderEnv {
+	if !ptr.Deref(spod.Spec.Enricher.EnableBpfRecorder, false) &&
+		!config.EnvEnabled(config.EnableBpfRecorderEnvKey) {
 		return nil, nil, fmt.Errorf("bpf recorder %w", errRecorderDisabled)
 	}
 
-	r.log.Info("Connecting to local GRPC bpf recorder server")
+	r.log.V(config.VerboseLevel).Info("Connecting to local GRPC bpf recorder server")
 
 	conn, err := r.DialBpfRecorder()
 	if err != nil {
@@ -932,19 +928,56 @@ func (s *bpfRecorderSession) Close() {
 	s.conn = nil
 }
 
-// startBpfRecorder starts the BPF recorder for the pod with the UID. The
-// recorder runs once per pod, so a retried start is not counted again.
+// startBpfRecorder starts the BPF recorder for the pod and its authorized
+// profiles, see authorizedProfiles. The recorder runs once per pod, so a
+// retried start is not counted again.
 func (r *RecorderReconciler) startBpfRecorder(
-	ctx context.Context, bpf *bpfRecorderSession, uid types.UID,
+	ctx context.Context, bpf *bpfRecorderSession, pod *corev1.Pod, profiles []profileToCollect,
 ) error {
 	recorderClient, err := bpf.Client(ctx)
 	if err != nil {
 		return err
 	}
 
-	r.log.Info("Starting BPF recorder on node", "uid", uid)
+	r.log.Info("Starting BPF recorder on node", "uid", pod.UID)
 
-	return r.StartBpfRecorder(ctx, recorderClient, bpfRecordingRequest(uid))
+	request := bpfRecordingRequest(pod.UID)
+	request.Profiles = recordedBpfProfiles(pod, profiles)
+
+	return r.StartBpfRecorder(ctx, recorderClient, request)
+}
+
+// recordedBpfProfiles returns the containers of the pod with the BPF
+// recording annotation of one of the profiles.
+func recordedBpfProfiles(
+	pod *corev1.Pod, profiles []profileToCollect,
+) []*bpfrecorderapi.RecordedProfile {
+	authorized := map[string]struct{}{}
+	for _, p := range profiles {
+		authorized[p.name] = struct{}{}
+	}
+
+	var recorded []*bpfrecorderapi.RecordedProfile
+
+	for _, key := range slices.Sorted(maps.Keys(pod.Annotations)) {
+		value := pod.Annotations[key]
+		if _, ok := authorized[value]; !ok {
+			continue
+		}
+
+		for _, prefix := range []string{
+			config.SeccompProfileRecordBpfAnnotationKey,
+			config.ApparmorProfileRecordBpfAnnotationKey,
+		} {
+			if container, ok := strings.CutPrefix(key, prefix); ok {
+				recorded = append(recorded, &bpfrecorderapi.RecordedProfile{
+					Container: container, Profile: value,
+				})
+			}
+		}
+	}
+
+	return recorded
 }
 
 // bpfRecordingRequest returns the request which starts or stops the BPF
@@ -1070,7 +1103,7 @@ func (r *RecorderReconciler) releasePod(
 		case profilerecordingapi.ProfileRecorderBpf:
 			r.releaseBpfProfiles(ctx, bpf, podToWatch.uid, podToWatch.profiles)
 		case profilerecordingapi.ProfileRecorderLogs:
-			r.releaseLogProfiles(ctx, podToWatch.profiles)
+			r.releaseLogProfiles(ctx, podToWatch.uid, podToWatch.profiles)
 		}
 	}
 
@@ -1126,8 +1159,11 @@ func (r *RecorderReconciler) dialEnricher() (enricherapi.EnricherClient, func(),
 	return enricherapi.NewEnricherClient(conn), closeConn, nil
 }
 
-// releaseLogProfiles drops the data the log enricher holds for profiles.
-func (r *RecorderReconciler) releaseLogProfiles(ctx context.Context, profiles []profileToCollect) {
+// releaseLogProfiles drops the data the log enricher holds for profiles of the
+// pod with the UID.
+func (r *RecorderReconciler) releaseLogProfiles(
+	ctx context.Context, uid types.UID, profiles []profileToCollect,
+) {
 	enricherClient, closeConn, err := r.dialEnricher()
 	if err != nil {
 		r.log.Error(err, "Unable to connect to the enricher for unrecordable pod")
@@ -1146,10 +1182,14 @@ func (r *RecorderReconciler) releaseLogProfiles(ctx context.Context, profiles []
 			err = r.ResetSyscalls(
 				ctx,
 				enricherClient,
-				&enricherapi.SyscallsRequest{Profile: prf.name},
+				&enricherapi.SyscallsRequest{Profile: prf.name, PodUid: string(uid)},
 			)
 		case profilerecordingapi.ProfileRecordingKindSelinuxProfile:
-			err = r.ResetAvcs(ctx, enricherClient, &enricherapi.AvcRequest{Profile: prf.name})
+			err = r.ResetAvcs(
+				ctx,
+				enricherClient,
+				&enricherapi.AvcRequest{Profile: prf.name, PodUid: string(uid)},
+			)
 		case profilerecordingapi.ProfileRecordingKindAppArmorProfile:
 			// parseLogAnnotations never yields it.
 		}
@@ -1189,7 +1229,8 @@ func (r *RecorderReconciler) collectProfile(
 
 	if podToWatch.recorder == profilerecordingapi.ProfileRecorderLogs {
 		if err := r.collectLogProfiles(
-			ctx, replicaSuffix, podName, podToWatch.profiles, podToWatch.recordings,
+			ctx, replicaSuffix, podName, podToWatch.uid, podToWatch.profiles,
+			podToWatch.recordings,
 		); err != nil {
 			return fmt.Errorf("collect log profile: %w", err)
 		}
@@ -1218,26 +1259,23 @@ func (r *RecorderReconciler) collectLogProfiles(
 	ctx context.Context,
 	replicaSuffix string,
 	podName types.NamespacedName,
+	uid types.UID,
 	profiles []profileToCollect,
 	recordings map[string]recordingState,
 ) error {
-	r.log.Info("Checking if enricher is enabled")
+	r.log.V(config.VerboseLevel).Info("Checking if enricher is enabled")
 
 	spod, err := r.getSPOD(ctx)
 	if err != nil {
 		return fmt.Errorf("getting SPOD config: %w", err)
 	}
 
-	enableLogEnricherEnv, err := strconv.ParseBool(os.Getenv(config.EnableLogEnricherEnvKey))
-	if err != nil {
-		enableLogEnricherEnv = false
-	}
-
-	if !ptr.Deref(spod.Spec.Enricher.EnableLogEnricher, false) && !enableLogEnricherEnv {
+	if !ptr.Deref(spod.Spec.Enricher.EnableLogEnricher, false) &&
+		!config.EnvEnabled(config.EnableLogEnricherEnvKey) {
 		return fmt.Errorf("log enricher %w", errRecorderDisabled)
 	}
 
-	r.log.Info("Connecting to local GRPC enricher server")
+	r.log.V(config.VerboseLevel).Info("Connecting to local GRPC enricher server")
 
 	enricherClient, closeConn, err := r.dialEnricher()
 	if err != nil {
@@ -1265,9 +1303,9 @@ func (r *RecorderReconciler) collectLogProfiles(
 
 		switch prf.kind {
 		case profilerecordingapi.ProfileRecordingKindSeccompProfile:
-			err = r.collectLogSeccompProfile(ctx, enricherClient, target, prf.name)
+			err = r.collectLogSeccompProfile(ctx, enricherClient, target, uid, prf.name)
 		case profilerecordingapi.ProfileRecordingKindSelinuxProfile:
-			err = r.collectLogSelinuxProfile(ctx, enricherClient, target, prf.name)
+			err = r.collectLogSelinuxProfile(ctx, enricherClient, target, uid, prf.name)
 		case profilerecordingapi.ProfileRecordingKindAppArmorProfile:
 			// parseLogAnnotations never yields it, the case keeps the switch
 			// exhaustive.
@@ -1354,11 +1392,16 @@ func (r *RecorderReconciler) collectLogSeccompProfile(
 	ctx context.Context,
 	enricherClient enricherapi.EnricherClient,
 	target *profileTarget,
+	uid types.UID,
 	profileID string,
 ) error {
 	// Collecting stops the recording, so that the syscalls of lines read
-	// afterwards are not recorded again for nobody to collect.
-	request := &enricherapi.SyscallsRequest{Profile: profileID, Collect: true}
+	// afterwards are not recorded again for nobody to collect. Only the
+	// syscalls of the containers of the pod are collected, another pod can
+	// carry the same recording annotation.
+	request := &enricherapi.SyscallsRequest{
+		Profile: profileID, Collect: true, PodUid: string(uid),
+	}
 	profileNamespacedName := target.name
 
 	collector := logProfileCollector{
@@ -1417,10 +1460,11 @@ func (r *RecorderReconciler) collectLogSelinuxProfile(
 	ctx context.Context,
 	enricherClient enricherapi.EnricherClient,
 	target *profileTarget,
+	uid types.UID,
 	profileID string,
 ) error {
 	// Collecting stops the recording, see collectLogSeccompProfile.
-	request := &enricherapi.AvcRequest{Profile: profileID, Collect: true}
+	request := &enricherapi.AvcRequest{Profile: profileID, Collect: true, PodUid: string(uid)}
 	profileNamespacedName := target.name
 
 	collector := logProfileCollector{
@@ -1705,8 +1749,14 @@ func (r *RecorderReconciler) collectBpfProfile(
 	}
 
 	if err != nil {
-		// skip empty profiles
+		// Skip empty profiles. The recorder still maps the containers of
+		// the profile to it, which keeps it from stopping a recording that
+		// no pod needs any more soon, so it gets reset all the same.
 		if errors.Is(err, errRecordedProfileNotFound) {
+			if resetErr := collector.reset(ctx, request); resetErr != nil {
+				r.log.Error(resetErr, "Unable to reset empty profile", "name", ptc.name)
+			}
+
 			return nil
 		}
 

@@ -40,6 +40,10 @@ const (
 	linkedPodsKey    = ".metadata.recordingActiveWorkloads"
 	finalizer        = "active-seccomp-profile-recording-lock"
 	reconcileTimeout = 1 * time.Minute
+
+	// recordingAnnotationsKey indexes the pods by the recordings which
+	// their recording annotations name.
+	recordingAnnotationsKey = ".metadata.annotations.recordings"
 )
 
 // NewController returns a new empty controller instance.
@@ -71,7 +75,7 @@ func (r *RecordingTrackerReconciler) SchemeBuilder() runtime.SchemeBuilder {
 // The Ready condition of a recording tells whether the SPODs enable its
 // recorder and whether the recording webhook selects its namespace.
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
-// +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,resources=securityprofilesoperatordaemons,verbs=get;list;watch
+// +kubebuilder:rbac:groups=security-profiles-operator.x-k8s.io,namespace=security-profiles-operator,resources=securityprofilesoperatordaemons,verbs=get;list;watch
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations,resourceNames=spo-mutating-webhook-configuration,verbs=get;list;watch
 //
 // The ProfileConflict condition of a recording names the profiles it would
@@ -225,8 +229,11 @@ func podRecordedBy(
 func (r *RecordingTrackerReconciler) recordingUsers(
 	ctx context.Context, recording *profilerecordingapi.ProfileRecording,
 ) ([]string, error) {
+	// The pods are only read, so the cached ones are not copied.
 	pods := &corev1.PodList{}
-	if err := r.client.List(ctx, pods, client.InNamespace(recording.Namespace)); err != nil {
+	if err := r.client.List(
+		ctx, pods, client.InNamespace(recording.Namespace), client.UnsafeDisableDeepCopy,
+	); err != nil {
 		return nil, fmt.Errorf("listing pods: %w", err)
 	}
 

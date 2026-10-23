@@ -28,6 +28,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	bpf "github.com/aquasecurity/libbpfgo"
@@ -41,6 +42,7 @@ const (
 	flagWrite    uint64 = 0x2
 	flagExec     uint64 = 0x4
 	flagSpawn    uint64 = 0x8
+	flagStat     uint64 = 0x10
 	sockStream   uint64 = 1
 	sockDgram    uint64 = 2
 	sockRaw      uint64 = 3
@@ -52,8 +54,8 @@ const (
 	afInet          uint64 = 2
 	afInet6         uint64 = 10
 
-	// maxTrackedPaths limits the number of unique paths recorded per mount namespace
-	// to prevent memory exhaustion (OOM) attacks from malicious workloads.
+	// maxTrackedPaths limits the number of unique paths recorded per recording
+	// key to prevent memory exhaustion (OOM) attacks from malicious workloads.
 	maxTrackedPaths = 10000
 
 	// maxTrackedKeys limits the number of distinct workloads tracked to
@@ -62,10 +64,12 @@ const (
 
 	// maxProfilePathBytes bounds the path bytes of a single profile. A profile
 	// merges the paths of all keys of a recording, and maxTrackedPaths paths
-	// of pathMax bytes for each of them would not fit into a gRPC message. A
-	// path can end up in two of the rule lists, which the bound leaves room
-	// for below the maximum message size.
-	maxProfilePathBytes = 6 * 1024 * 1024
+	// of pathMax bytes for each of them would neither fit into a gRPC message
+	// nor into an object of the API server, which etcd limits to 1.5 MiB by
+	// default. A path can end up in two of the rule lists, and the managed
+	// fields of the object list every element of these sets again, which the
+	// bound leaves room for below that limit.
+	maxProfilePathBytes = 256 * 1024
 
 	// maxNormalizedPaths bounds the cache of normalized file paths.
 	maxNormalizedPaths = 4096
@@ -86,10 +90,8 @@ var (
 
 // recordingKey identifies a group of processes, usually the ones of a
 // container. It is the cgroup ID or the mount namespace the BPF program
-// reports, see get_key in recorder.bpf.c.
-// Note: on a host running concurrent containers, there will be multiple process running with
-// the same PID but they are assigned to different keys since they run in different containers.
-// Therefore, in order to have unique apparmor profiles, each profile is recorded per key.
+// reports, see get_key in recorder.bpf.c. The data of a profile is merged from
+// the keys of its containers.
 type recordingKey uint64
 
 // errBPFLSMDisabled tells that the kernel lacks the BPF LSM the AppArmor hooks
@@ -114,6 +116,12 @@ type AppArmorRecorder struct {
 	recordedCaps    *bpf.BPFMap
 	recordedSockets *bpf.BPFMap
 
+	// stopped is set while nothing is recording. The events which were still
+	// queued when the recording stopped are dropped then, so that they do not
+	// take up the keys of the next recording. The handlers check it under
+	// the lock of the data they record, which StopRecording holds to set it.
+	stopped atomic.Bool
+
 	recordedSocketsUse     map[recordingKey]*BpfAppArmorSocketTypes
 	lockRecordedSocketsUse sync.Mutex
 
@@ -122,6 +130,11 @@ type AppArmorRecorder struct {
 
 	recordedFiles     map[recordingKey]map[string]*fileAccess
 	lockRecordedFiles sync.Mutex
+	// statOnly holds the paths which only got stat'ed so far, which need no
+	// rule, see classifyFileAccess. They do not take up the tracked paths of
+	// recordedFiles, and are bounded by maxTrackedPaths of their own. Guarded
+	// by lockRecordedFiles.
+	statOnly map[recordingKey]map[string]struct{}
 
 	// trackedKeys holds the keys data is recorded for, bounded by
 	// maxTrackedKeys across files, sockets and capabilities.
@@ -155,6 +168,9 @@ type fileAccess struct {
 	write bool
 	exec  bool
 	spawn bool
+	// stat is set if the attributes of the file got read, which AppArmor
+	// checks read access for, see classifyFileAccess.
+	stat bool
 }
 
 type BpfAppArmorSocketTypes struct {
@@ -194,6 +210,7 @@ func newAppArmorRecorder(logger logr.Logger, programName string) *AppArmorRecord
 		recordedCapabilities:     map[recordingKey][]int{},
 		lockRecordedCapabilities: sync.Mutex{},
 		recordedFiles:            map[recordingKey]map[string]*fileAccess{},
+		statOnly:                 map[recordingKey]map[string]struct{}{},
 		lockRecordedFiles:        sync.Mutex{},
 		trackedKeys:              map[recordingKey]struct{}{},
 		maxPathsWarned:           map[recordingKey]bool{},
@@ -202,9 +219,27 @@ func newAppArmorRecorder(logger logr.Logger, programName string) *AppArmorRecord
 	}
 }
 
+// maxExcludedKeys bounds the excluded keys like the exclude_keys map of the
+// BPF program, which holds as many.
+const maxExcludedKeys = 32 * 1024
+
 // Exclude drops the data recorded for key and ignores its later events.
+//
+// The excluded keys are only pruned for cgroup keys, see
+// pruneRemovedCgroups, so they are bounded otherwise. The BPF program
+// forgets its oldest excluded keys as well and reports a workload whose key
+// got forgotten again, which excludes it again.
 func (b *AppArmorRecorder) Exclude(key uint64) {
 	b.lockExcluded.Lock()
+
+	if _, ok := b.excluded[recordingKey(key)]; !ok && len(b.excluded) >= maxExcludedKeys {
+		for excluded := range b.excluded {
+			delete(b.excluded, excluded)
+
+			break
+		}
+	}
+
 	b.excluded[recordingKey(key)] = struct{}{}
 	b.lockExcluded.Unlock()
 
@@ -297,6 +332,19 @@ func (b *AppArmorRecorder) StartRecording(r *BpfRecorder) error {
 		return ErrStartBeforeLoad
 	}
 
+	// Under the locks of StopRecording, like setting it, so that a handler
+	// sees the state of one recording while it holds its lock.
+	b.lockRecordedSocketsUse.Lock()
+	defer b.lockRecordedSocketsUse.Unlock()
+
+	b.lockRecordedCapabilities.Lock()
+	defer b.lockRecordedCapabilities.Unlock()
+
+	b.lockRecordedFiles.Lock()
+	defer b.lockRecordedFiles.Unlock()
+
+	b.stopped.Store(false)
+
 	return nil
 }
 
@@ -310,9 +358,12 @@ func (b *AppArmorRecorder) StopRecording(r *BpfRecorder) error {
 	b.lockRecordedFiles.Lock()
 	defer b.lockRecordedFiles.Unlock()
 
+	b.stopped.Store(true)
+
 	clear(b.recordedSocketsUse)
 	clear(b.recordedCapabilities)
 	clear(b.recordedFiles)
+	clear(b.statOnly)
 	clear(b.maxPathsWarned)
 
 	b.lockTrackedKeys.Lock()
@@ -439,7 +490,18 @@ func (b *AppArmorRecorder) handleFileEvent(fileEvent *bpfEvent) {
 	defer b.lockRecordedFiles.Unlock()
 
 	// The key may have been excluded since the check above, see trackKey.
-	if b.isExcluded(fileEvent.Key) || !b.trackKey(key) {
+	if b.stopped.Load() || b.isExcluded(fileEvent.Key) || !b.trackKey(key) {
+		return
+	}
+
+	path, ok := b.recordedFiles[key][fileName]
+	if !ok && fileEvent.Flags == flagStat {
+		// A stat alone needs no rule, it only matters for a later access
+		// of the path, see classifyFileAccess. Stat heavy workloads, like
+		// a module resolution walking many directories, would truncate the
+		// rules otherwise.
+		b.recordStat(key, fileName)
+
 		return
 	}
 
@@ -447,7 +509,6 @@ func (b *AppArmorRecorder) handleFileEvent(fileEvent *bpfEvent) {
 		b.recordedFiles[key] = map[string]*fileAccess{}
 	}
 
-	path, ok := b.recordedFiles[key][fileName]
 	if !ok {
 		// Enforce a limit on max tracked files to avoid OOM. The paths which
 		// are tracked already still gather their access flags.
@@ -461,7 +522,10 @@ func (b *AppArmorRecorder) handleFileEvent(fileEvent *bpfEvent) {
 			return
 		}
 
-		path = &fileAccess{}
+		_, stat := b.statOnly[key][fileName]
+		delete(b.statOnly[key], fileName)
+
+		path = &fileAccess{stat: stat}
 		b.recordedFiles[key][fileName] = path
 	}
 
@@ -469,6 +533,22 @@ func (b *AppArmorRecorder) handleFileEvent(fileEvent *bpfEvent) {
 	path.write = path.write || ((fileEvent.Flags & flagWrite) > 0)
 	path.exec = path.exec || ((fileEvent.Flags & flagExec) > 0)
 	path.spawn = path.spawn || ((fileEvent.Flags & flagSpawn) > 0)
+	path.stat = path.stat || ((fileEvent.Flags & flagStat) > 0)
+}
+
+// recordStat remembers that the path only got stat'ed so far. A path beyond
+// maxTrackedPaths is not remembered, a later write of it gets a write only
+// rule then. It has to be called with lockRecordedFiles held.
+func (b *AppArmorRecorder) recordStat(key recordingKey, fileName string) {
+	paths, ok := b.statOnly[key]
+	if !ok {
+		paths = map[string]struct{}{}
+		b.statOnly[key] = paths
+	}
+
+	if len(paths) < maxTrackedPaths {
+		paths[fileName] = struct{}{}
+	}
 }
 
 func (b *AppArmorRecorder) handleSocketEvent(socketEvent *bpfEvent) {
@@ -483,7 +563,7 @@ func (b *AppArmorRecorder) handleSocketEvent(socketEvent *bpfEvent) {
 	defer b.lockRecordedSocketsUse.Unlock()
 
 	// Checked under the lock, see trackKey.
-	if b.isExcluded(socketEvent.Key) {
+	if b.stopped.Load() || b.isExcluded(socketEvent.Key) {
 		return
 	}
 
@@ -544,7 +624,7 @@ func (b *AppArmorRecorder) handleCapabilityEvent(capEvent *bpfEvent) {
 	defer b.lockRecordedCapabilities.Unlock()
 
 	// Checked under the lock, see trackKey.
-	if b.isExcluded(capEvent.Key) {
+	if b.stopped.Load() || b.isExcluded(capEvent.Key) {
 		return
 	}
 
@@ -598,6 +678,7 @@ func (b *AppArmorRecorder) Clear(keys []uint64) {
 	for _, k := range keys {
 		key := recordingKey(k)
 		delete(b.recordedFiles, key)
+		delete(b.statOnly, key)
 		delete(b.recordedCapabilities, key)
 		delete(b.recordedSocketsUse, key)
 		delete(b.maxPathsWarned, key)
@@ -641,6 +722,12 @@ func (b *AppArmorRecorder) GetKnownKeys() []uint64 {
 
 	known := make(map[uint64]struct{}, len(b.recordedFiles))
 	for key := range b.recordedFiles {
+		known[uint64(key)] = struct{}{}
+	}
+
+	// A key which only stat'ed files is known as well, so that its data
+	// gets swept with it.
+	for key := range b.statOnly {
 		known[uint64(key)] = struct{}{}
 	}
 
@@ -769,6 +856,25 @@ type fileRule struct {
 	writes bool
 }
 
+// merge returns the rule which allows the access of both rules.
+func (r fileRule) merge(other fileRule) fileRule {
+	return fileRule{
+		execute: r.execute || other.execute,
+		library: r.library || other.library,
+		read:    r.read || other.read,
+		write:   r.write || other.write,
+		reads:   r.reads || other.reads,
+		writes:  r.writes || other.writes,
+	}
+}
+
+// emits reports whether the rule needs a rule of the profile on its own, see
+// processExecFsEvents. A rule which only reads or writes, like for a path the
+// abstractions allow, changes a rule of the same path of another key at most.
+func (r fileRule) emits() bool {
+	return r.execute || r.library || r.read || r.write
+}
+
 // processExecFsEvents classifies the file accesses recorded for keys.
 func (b *AppArmorRecorder) processExecFsEvents(keys []uint64) (BpfAppArmorFileProcessed, bool) {
 	b.lockRecordedFiles.Lock()
@@ -782,6 +888,7 @@ func (b *AppArmorRecorder) processExecFsEvents(keys []uint64) (BpfAppArmorFilePr
 	rules := map[string]fileRule{}
 	found := false
 	pathBytes := 0
+	charged := map[string]bool{}
 	truncated := false
 
 	for _, k := range keys {
@@ -798,8 +905,11 @@ func (b *AppArmorRecorder) processExecFsEvents(keys []uint64) (BpfAppArmorFilePr
 				continue
 			}
 
-			merged, known := rules[fileName]
-			if !known {
+			merged := rules[fileName].merge(b.classifyFileAccess(fileName, files[fileName]))
+
+			// Only the paths which get a rule take up the size of the
+			// profile, the ones the abstractions allow do not.
+			if merged.emits() && !charged[fileName] {
 				if pathBytes+len(fileName) > maxProfilePathBytes {
 					truncated = true
 
@@ -807,15 +917,9 @@ func (b *AppArmorRecorder) processExecFsEvents(keys []uint64) (BpfAppArmorFilePr
 				}
 
 				pathBytes += len(fileName)
+				charged[fileName] = true
 			}
 
-			rule := b.classifyFileAccess(fileName, files[fileName])
-			merged.execute = merged.execute || rule.execute
-			merged.library = merged.library || rule.library
-			merged.read = merged.read || rule.read
-			merged.write = merged.write || rule.write
-			merged.reads = merged.reads || rule.reads
-			merged.writes = merged.writes || rule.writes
 			rules[fileName] = merged
 		}
 	}
@@ -897,6 +1001,14 @@ func (b *AppArmorRecorder) classifyFileAccess(fileName string, access *fileAcces
 		rule.reads = access.read
 	}
 
+	// A stat needs read access, but no rule of its own: a path which only
+	// got stat'ed, like an inherited /dev/null, would get a read only rule
+	// otherwise, which denies the writes the abstractions allow. It keeps a
+	// write only rule from denying the read. Known limitation: a path which
+	// only gets stat'ed, and which the abstractions do not allow, has no rule
+	// in the recorded profile, so the stat gets denied once it is enforced.
+	rule.reads = rule.reads || access.stat
+
 	return rule
 }
 
@@ -939,9 +1051,11 @@ func processDeletedFiles(
 }
 
 // allowAnyFiles allows any file in a directory if at least two files of it are
-// allowed. Directories, which the recorder reports with a trailing slash, are
-// kept as they are: the glob of the files in a directory does not match the
-// directory itself, which creating it needs.
+// allowed. A file which got stat'ed and written counts as read write as well,
+// so it can make a directory collapse into the glob too. Directories, which
+// the recorder reports with a trailing slash, are kept as they are: the glob of
+// the files in a directory does not match the directory itself, which creating
+// it needs.
 func allowAnyFiles(filePaths []string) []string {
 	dupDirs := map[string]int{}
 

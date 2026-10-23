@@ -47,6 +47,7 @@ import (
 	secprofnodestatusapi "sigs.k8s.io/security-profiles-operator/api/secprofnodestatus/v1"
 	selinuxprofileapi "sigs.k8s.io/security-profiles-operator/api/selinuxprofile/v1"
 	spodapi "sigs.k8s.io/security-profiles-operator/api/spod/v1"
+	"sigs.k8s.io/security-profiles-operator/internal/pkg/config"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/common"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/daemon/metrics"
 	"sigs.k8s.io/security-profiles-operator/internal/pkg/manager/spod/bindata"
@@ -304,9 +305,14 @@ func TestReconcileDeletionWithoutNodeStatus(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, f.client.Delete(ctx, f.nodeStatus(t)))
 
+	// A reload which never happened is not needed anymore once the profile
+	// is gone from the node.
+	f.r.reloadNeededSince(f.profile(t).GetUID(), installReload, 1, "hash", time.Now())
+
 	res, err := f.r.Reconcile(ctx, f.request)
 	require.NoError(t, err)
 	require.Equal(t, reconcile.Result{}, res)
+	require.Empty(t, f.r.reloadNeeds)
 
 	err = f.client.Get(ctx, f.request.NamespacedName, &selinuxprofileapi.SelinuxProfile{})
 	require.True(t, kerrors.IsNotFound(err), "profile should be deleted, got %v", err)
@@ -965,6 +971,100 @@ func TestReconcileDeletionPolicyRemoved(t *testing.T) {
 	require.Equal(t, testReconcileProfile, jobs.Items[0].Labels["policy"])
 	require.Equal(t, testReconcileNode, jobs.Items[0].Spec.Template.Spec.NodeName)
 	require.Empty(t, f.events())
+}
+
+// semodule cannot remove a module which another one inherits, and selinuxd
+// does not retry it, so the policy stays until the inheriting one is gone. The
+// policy files of the existing profiles tell it, not the specs, which may have
+// changed since. Only a profile without policy file, whose module may still be
+// installed, counts by its spec.
+func TestReconcileDeletionPolicyInherited(t *testing.T) {
+	t.Parallel()
+
+	f := newReconcileFixture(t, testProfile(), nil,
+		selinuxd(t, true, http.StatusOK, `{"status": "Installed", "msg": ""}`))
+	ctx := context.Background()
+
+	// A spec which inherits the policy, but whose policy on the node does
+	// not, does not keep it.
+	stale := testProfile()
+	stale.Name = "stale"
+	stale.Spec.Inherit = []selinuxprofileapi.PolicyRef{{
+		Kind: selinuxprofileapi.SelinuxProfilePolicyKind, Name: testReconcileProfile,
+	}}
+	require.NoError(t, f.client.Create(ctx, stale))
+
+	child := testProfile()
+	child.Name = "child"
+	require.NoError(t, f.client.Create(ctx, child))
+
+	// The policy file of a profile which is gone, like one deleted while
+	// the daemon was down, does not keep it either.
+	orphan := testProfile()
+	orphan.Name = "orphan"
+
+	inheriting := []byte("(block inheriting\n(blockinherit " + testReconcileProfile + ")\n)\n")
+	policyPath := f.r.policyPath(f.profile(t))
+	require.NoError(t, os.WriteFile(policyPath, []byte("(block my-policy)"), 0o600))
+	require.NoError(t, os.WriteFile(f.r.policyPath(stale), []byte("(block stale)"), 0o600))
+	require.NoError(t, os.WriteFile(f.r.policyPath(child), inheriting, 0o600))
+	require.NoError(t, os.WriteFile(f.r.policyPath(orphan), inheriting, 0o600))
+
+	f.prepareDeletion(t)
+
+	res, err := f.r.Reconcile(ctx, f.request)
+	require.NoError(t, err)
+	require.Equal(t, reconcile.Result{RequeueAfter: common.InUseRetry}, res)
+	require.FileExists(t, policyPath)
+
+	// A profile whose policy does not translate anymore has no policy file
+	// after a restart of the daemon, but its module may still be installed,
+	// so it keeps the policy by its spec. The child without policy file
+	// does not inherit it by its spec.
+	unwritten := testProfile()
+	unwritten.Name = "unwritten"
+	unwritten.Spec.Inherit = stale.Spec.Inherit
+	require.NoError(t, f.client.Create(ctx, unwritten))
+	require.NoError(t, os.Remove(f.r.policyPath(child)))
+
+	res, err = f.r.Reconcile(ctx, f.request)
+	require.NoError(t, err)
+	require.Equal(t, reconcile.Result{RequeueAfter: common.InUseRetry}, res)
+	require.FileExists(t, policyPath)
+
+	// Once no other profile inherits it, the removal goes on.
+	require.NoError(t, f.client.Delete(ctx, unwritten))
+
+	res, err = f.r.Reconcile(ctx, f.request)
+	require.NoError(t, err)
+	require.Equal(t, reconcile.Result{RequeueAfter: selinuxdPollInterval}, res)
+	require.NoFileExists(t, policyPath)
+}
+
+// A policy which the node never wrote, like one which conflicts with a system
+// module of the same name, is not installed, so the policies which inherit the
+// system module do not keep its deletion from completing.
+func TestReconcileDeletionUnwrittenPolicyInherited(t *testing.T) {
+	t.Parallel()
+
+	f := newReconcileFixture(t, testProfile(), nil,
+		selinuxd(t, true, http.StatusNotFound, ""))
+	ctx := context.Background()
+
+	child := testProfile()
+	child.Name = "child"
+	require.NoError(t, f.client.Create(ctx, child))
+	require.NoError(t, os.WriteFile(f.r.policyPath(child), []byte(
+		"(block child\n(blockinherit "+testReconcileProfile+")\n)\n"), 0o600))
+
+	f.prepareDeletion(t)
+
+	res, err := f.r.Reconcile(ctx, f.request)
+	require.NoError(t, err)
+	require.Equal(t, reconcile.Result{}, res)
+
+	err = f.client.Get(ctx, f.request.NamespacedName, &selinuxprofileapi.SelinuxProfile{})
+	require.True(t, kerrors.IsNotFound(err), "profile should be deleted, got %v", err)
 }
 
 func TestReconcileDeletionReloadJobFailure(t *testing.T) {
@@ -2035,4 +2135,95 @@ func TestReconcileInstalledProfileDoesNotWaitForInheritedProfile(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, reconcile.Result{RequeueAfter: common.Wait}, res)
 	require.Equal(t, secprofnodestatusapi.ProfileStatePending, status())
+}
+
+// newPermissiveFixture returns a fixture which validates the profiles with
+// the handler of SelinuxProfiles against a SPOD which sets whether permissive
+// profiles are allowed.
+func newPermissiveFixture(
+	t *testing.T, profile *selinuxprofileapi.SelinuxProfile, allowPermissive bool,
+	objs ...client.Object,
+) (*reconcileFixture, *spodapi.SecurityProfilesOperatorDaemon) {
+	t.Helper()
+
+	f := newReconcileFixture(t, profile, nil,
+		selinuxd(t, true, http.StatusOK, `{"status": "Installed", "msg": ""}`))
+	f.r.objectHandlerInit = newSelinuxProfileHandler
+
+	spod := &spodapi.SecurityProfilesOperatorDaemon{
+		ObjectMeta: metav1.ObjectMeta{Name: config.SPOdName, Namespace: testReconcileNamespace},
+	}
+	spod.Spec.Selinux.Options.AllowPermissiveProfiles = &allowPermissive
+	require.NoError(t, f.client.Create(t.Context(), spod))
+
+	for _, obj := range objs {
+		require.NoError(t, f.client.Create(t.Context(), obj))
+	}
+
+	return f, spod
+}
+
+// A permissive profile bypasses the SELinux denylist, so a SPOD can reject
+// permissive profiles. A rejected profile is not retried until the SPOD or
+// the profile change, and an unset option allows them.
+func TestReconcilePermissiveProfileNeedsSPODOption(t *testing.T) {
+	t.Parallel()
+
+	profile := testProfile()
+	profile.Spec.Mode = selinuxprofileapi.SelinuxModePermissive
+
+	f, spod := newPermissiveFixture(t, profile, false)
+
+	res, err := f.r.Reconcile(t.Context(), f.request)
+	require.NoError(t, err)
+	require.Equal(t, reconcile.Result{}, res)
+	require.Equal(t, secprofnodestatusapi.ProfileStateError, f.nodeStatus(t).Status.Status)
+	require.Contains(t, f.nodeStatus(t).Status.Message, "allowPermissiveProfiles")
+
+	evts := f.events()
+	require.Len(t, evts, 1)
+	require.Contains(t, evts[0], "Warning "+reasonCannotInstallPolicy)
+	require.Contains(t, evts[0], "allowPermissiveProfiles")
+
+	policyFile := filepath.Join(f.r.policyDir, testReconcileProfile+".cil")
+	_, err = os.Stat(policyFile)
+	require.True(t, os.IsNotExist(err), "the policy must not be written")
+
+	spod.Spec.Selinux.Options.AllowPermissiveProfiles = nil
+	require.NoError(t, f.client.Update(t.Context(), spod))
+
+	res, err = f.r.Reconcile(t.Context(), f.request)
+	require.NoError(t, err)
+	require.Equal(t, selinuxdPollInterval, res.RequeueAfter)
+	require.Equal(t, secprofnodestatusapi.ProfileStateInProgress, f.nodeStatus(t).Status.Status)
+
+	content, err := os.ReadFile(policyFile)
+	require.NoError(t, err)
+	require.Contains(t, string(content), "(typepermissive process)")
+}
+
+// An enforcing profile which inherits a permissive one would be permissive as
+// well, because blockinherit copies the typepermissive statement, so it is
+// rejected together with permissive profiles.
+func TestReconcileInheritedPermissiveProfileNeedsSPODOption(t *testing.T) {
+	t.Parallel()
+
+	parent := testProfile()
+	parent.Name = "parent"
+	parent.Spec.Mode = selinuxprofileapi.SelinuxModePermissive
+
+	profile := testProfile()
+	profile.Spec.Inherit = []selinuxprofileapi.PolicyRef{{
+		Kind: selinuxprofileapi.SelinuxProfilePolicyKind,
+		Name: parent.Name,
+	}}
+
+	f, _ := newPermissiveFixture(t, profile, false, parent)
+
+	res, err := f.r.Reconcile(t.Context(), f.request)
+	require.NoError(t, err)
+	require.Equal(t, reconcile.Result{}, res)
+	require.Equal(t, secprofnodestatusapi.ProfileStateError, f.nodeStatus(t).Status.Status)
+	require.Contains(t, f.nodeStatus(t).Status.Message, errInheritPermissive.Error())
+	require.Contains(t, f.nodeStatus(t).Status.Message, parent.Name)
 }
